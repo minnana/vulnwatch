@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VulnWatch 漏洞情报监控</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --text: #1f2329;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --primary: #2563eb;
+    --primary-hover: #1d4ed8;
+    --red: #dc2626;
+    --orange: #ea580c;
+    --yellow: #ca8a04;
+    --green: #16a34a;
+    --gray: #6b7280;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.6;
+  }
+  .layout { display: flex; min-height: 100vh; }
+  .sidebar {
+    width: 220px; background: #1f2937; color: #e5e7eb; padding: 20px 0;
+    position: sticky; top: 0; height: 100vh; flex-shrink: 0;
+  }
+  .sidebar .brand { padding: 0 20px 20px; font-size: 18px; font-weight: 700; color: #fff; }
+  .sidebar .brand span { color: #60a5fa; }
+  .nav-item {
+    display: block; padding: 12px 20px; color: #d1d5db; cursor: pointer;
+    border-left: 3px solid transparent; text-decoration: none; font-size: 14px;
+  }
+  .nav-item:hover { background: #374151; color: #fff; }
+  .nav-item.active { background: #374151; color: #fff; border-left-color: #60a5fa; }
+  .main { flex: 1; padding: 24px 32px; max-width: 1200px; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  h2 { font-size: 17px; margin-bottom: 16px; }
+  .subtitle { color: var(--muted); margin-bottom: 24px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 2px rgba(0,0,0,.04);
+  }
+  .toolbar { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+  input, select, textarea {
+    padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px;
+    font-size: 14px; background: #fff; color: var(--text); outline: none;
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--primary); }
+  textarea { width: 100%; resize: vertical; font-family: inherit; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px;
+    border: none; border-radius: 6px; cursor: pointer; font-size: 14px;
+    background: var(--primary); color: #fff; text-decoration: none;
+  }
+  .btn:hover { background: var(--primary-hover); }
+  .btn.secondary { background: #fff; color: var(--text); border: 1px solid var(--border); }
+  .btn.secondary:hover { background: #f3f4f6; }
+  .btn.danger { background: var(--red); }
+  .btn.small { padding: 4px 10px; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; }
+  tr:hover td { background: #f9fafb; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600;
+  }
+  .badge.critical { background: #fee2e2; color: var(--red); }
+  .badge.high { background: #ffedd5; color: var(--orange); }
+  .badge.medium { background: #fef9c3; color: var(--yellow); }
+  .badge.low { background: #dcfce7; color: var(--green); }
+  .badge.unknown { background: #f3f4f6; color: var(--gray); }
+  .badge.kev { background: #dc2626; color: #fff; }
+  .form-row { margin-bottom: 14px; }
+  .form-row label { display: block; margin-bottom: 4px; font-weight: 600; font-size: 13px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .stat-box { text-align: center; padding: 16px; }
+  .stat-box .num { font-size: 28px; font-weight: 700; }
+  .stat-box .label { color: var(--muted); font-size: 13px; }
+  .toast {
+    position: fixed; top: 20px; right: 20px; background: #111827; color: #fff;
+    padding: 12px 20px; border-radius: 8px; z-index: 999; opacity: 0; transition: opacity .3s;
+  }
+  .toast.show { opacity: 1; }
+  .page { display: none; }
+  .page.active { display: block; }
+  .link { color: var(--primary); text-decoration: none; }
+  .empty { text-align: center; color: var(--muted); padding: 40px 0; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <div class="sidebar">
+    <div class="brand">🔒 Vuln<span>Watch</span></div>
+    <a class="nav-item active" data-page="dashboard">📊 概览</a>
+    <a class="nav-item" data-page="vulns">🛡️ 漏洞列表</a>
+    <a class="nav-item" data-page="sources">📡 监控源</a>
+    <a class="nav-item" data-page="settings">⚙️ 配置</a>
+  </div>
+  <div class="main">
+    <!-- 概览 -->
+    <div class="page active" id="page-dashboard">
+      <h1>漏洞情报概览</h1>
+      <p class="subtitle">系统自动采集官方安全公告,重要漏洞高亮并推送钉钉</p>
+      <div class="card">
+        <div class="grid-2" style="grid-template-columns:repeat(4,1fr)">
+          <div class="stat-box"><div class="num" id="stat-total" style="color:var(--primary)">-</div><div class="label">漏洞总数(近7天)</div></div>
+          <div class="stat-box"><div class="num" id="stat-critical" style="color:var(--red)">-</div><div class="label">严重</div></div>
+          <div class="stat-box"><div class="num" id="stat-high" style="color:var(--orange)">-</div><div class="label">高危</div></div>
+          <div class="stat-box"><div class="num" id="stat-kev" style="color:var(--red)">-</div><div class="label">在野利用(KEV)</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="toolbar">
+          <button class="btn" onclick="doCollectAll()">🔄 立即采集</button>
+          <span class="hint">手动触发一次全量采集(每个源间有间隔,请耐心等待)</span>
+        </div>
+        <div id="collect-result" class="hint"></div>
+      </div>
+    </div>
+
+    <!-- 漏洞列表 -->
+    <div class="page" id="page-vulns">
+      <h1>漏洞列表</h1>
+      <div class="card">
+        <div class="toolbar">
+          <select id="f-severity">
+            <option value="">全部等级</option>
+            <option value="CRITICAL">严重</option>
+            <option value="HIGH">高危</option>
+            <option value="MEDIUM">中危</option>
+            <option value="LOW">低危</option>
+          </select>
+          <input id="f-keyword" placeholder="搜索 CVE / 标题 / 产品" style="width:220px">
+          <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="f-kev">仅看在野利用</label>
+          <select id="f-days">
+            <option value="1">近1天</option>
+            <option value="3">近3天</option>
+            <option value="7" selected>近7天</option>
+            <option value="30">近30天</option>
+          </select>
+          <button class="btn" onclick="loadVulns()">查询</button>
+        </div>
+        <table>
+          <thead><tr>
+            <th>等级</th><th>CVE / 标题</th><th>CVSS</th><th>来源</th><th>发布日期</th><th>详情</th>
+          </tr></thead>
+          <tbody id="vuln-tbody"></tbody>
+        </table>
+        <div id="vuln-empty" class="empty" style="display:none">暂无数据,点击「立即采集」拉取</div>
+      </div>
+    </div>
+
+    <!-- 监控源 -->
+    <div class="page" id="page-sources">
+      <h1>监控源管理</h1>
+      <div class="card">
+        <div class="toolbar">
+          <button class="btn" onclick="showSourceForm()">➕ 新增监控源</button>
+        </div>
+        <table>
+          <thead><tr>
+            <th>名称</th><th>类别</th><th>类型</th><th>CPE / 关键词</th><th>状态</th><th>操作</th>
+          </tr></thead>
+          <tbody id="source-tbody"></tbody>
+        </table>
+      </div>
+      <div class="card" id="source-form" style="display:none">
+        <h2 id="source-form-title">新增监控源</h2>
+        <input type="hidden" id="s-id">
+        <div class="form-row"><label>名称</label><input id="s-name" style="width:100%"></div>
+        <div class="grid-2">
+          <div class="form-row"><label>类别</label>
+            <select id="s-category" style="width:100%">
+              <option value="OS">操作系统</option><option value="NAS">NAS</option>
+              <option value="Virtualization">虚拟化</option><option value="WebServer">Web服务器</option>
+              <option value="Database">数据库</option><option value="Runtime">语言运行时</option>
+              <option value="Intelligence">情报</option><option value="Other">其他</option>
+            </select>
+          </div>
+          <div class="form-row"><label>采集类型</label>
+            <select id="s-type" style="width:100%" onchange="onTypeChange()">
+              <option value="nvd_cpe">NVD 关键词/CPE 检索</option>
+              <option value="rss">RSS / Atom</option>
+              <option value="html">HTML 公告页</option>
+              <option value="go_osv">Go 官方漏洞库</option>
+              <option value="cisa_kev">CISA KEV</option>
+              <option value="chaitin">长亭漏洞库</option>
+              <option value="oscs">OSCS 开源安全情报</option>
+              <option value="qianxin_ti">奇安信威胁情报</option>
+              <option value="threatbook">微步在线</option>
+              <option value="seebug">知道创宇 Seebug</option>
+              <option value="struts2">Apache Struts2 公告</option>
+              <option value="avd">阿里云漏洞库 (需 Playwright)</option>
+              <option value="venustech">启明星辰 (需 Playwright)</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-row"><label>URL</label><input id="s-url" style="width:100%" placeholder="API / RSS 地址"></div>
+        <div class="form-row" id="s-cpe-row"><label>CPE 匹配串(可选)</label><input id="s-cpe" style="width:100%" placeholder="留空则用下方关键词搜索;精确版本示例 cpe:2.3:o:vmware:esxi:7.0:*:*:*:*:*:*:*"></div>
+        <div class="form-row" id="s-kw-row" style="display:none"><label>关键词(逗号分隔,可选)</label><input id="s-kw" style="width:100%" placeholder="NVD 检索关键词 或 RSS 标题过滤关键词"></div>
+        <div class="form-row"><label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="s-enabled" checked>启用</label></div>
+        <div class="toolbar">
+          <button class="btn" onclick="saveSource()">保存</button>
+          <button class="btn secondary" onclick="hideSourceForm()">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 配置 -->
+    <div class="page" id="page-settings">
+      <h1>系统配置</h1>
+      <div class="card">
+        <h2>🔔 通知通道</h2>
+        <div class="form-row">
+          <label>通知通道</label>
+          <select id="set-channel" onchange="onChannelChange()">
+            <option value="dingtalk">钉钉</option>
+            <option value="wecom">企业微信</option>
+            <option value="feishu">飞书</option>
+            <option value="serverchan">Server酱</option>
+            <option value="pushplus">PushPlus</option>
+          </select>
+          <div class="hint">选择推送用哪个通道,各通道凭证独立配置</div>
+        </div>
+        <div class="form-row"><label>钉钉 Webhook</label><input id="set-webhook" style="width:100%" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..."></div>
+        <div class="form-row"><label>钉钉加签密钥(Secret)</label><input id="set-secret" style="width:100%" placeholder="SEC..."></div>
+        <div class="form-row"><label>企业微信 Webhook</label><input id="set-wecom-webhook" style="width:100%" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."></div>
+        <div class="form-row"><label>飞书 Webhook</label><input id="set-feishu-webhook" style="width:100%" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."></div>
+        <div class="form-row"><label>Server酱 SendKey</label><input id="set-serverchan-sendkey" style="width:100%" placeholder="SCT..."></div>
+        <div class="form-row"><label>PushPlus Token</label><input id="set-pushplus-token" style="width:100%" placeholder="你的 token"></div>
+        <button class="btn" onclick="saveSettings()">保存通知配置</button>
+        <button class="btn secondary" onclick="testNotify()">发送测试消息</button>
+        <span id="test-result" class="hint"></span>
+      </div>
+      <div class="card">
+        <h2>🎯 推送过滤</h2>
+        <div class="form-row">
+          <label>推送阈值</label>
+          <select id="set-threshold">
+            <option value="CRITICAL">仅严重</option>
+            <option value="HIGH" selected>高危及以上</option>
+            <option value="MEDIUM">中危及以上</option>
+            <option value="LOW">全部</option>
+          </select>
+          <div class="hint">达到该等级及以上的漏洞才推送;在野利用(KEV)始终推送</div>
+        </div>
+        <div class="form-row">
+          <label>产品关键词白名单(逗号分隔,留空=全部)</label>
+          <input id="set-include" style="width:100%" placeholder="如:nginx,redis,vmware">
+          <div class="hint">只关心命中这些关键词的产品,适合"只看我司用到的产品"</div>
+        </div>
+        <div class="form-row">
+          <label>产品关键词黑名单(逗号分隔,留空=不排除)</label>
+          <input id="set-exclude" style="width:100%" placeholder="如:oracle,mongodb">
+          <div class="hint">命中这些关键词的漏洞不推送</div>
+        </div>
+        <div class="form-row">
+          <label>必含标签(逗号分隔,留空=不过滤)</label>
+          <input id="set-required-tags" style="width:100%" placeholder="如:POC公开,发布预警,技术细节公布">
+          <div class="hint">只推送带有这些标签的漏洞,让推送更精准</div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>🌙 静默时段</h2>
+        <div class="form-row">
+          <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="set-silent-enabled">启用静默时段(不推送)</label>
+        </div>
+        <div class="grid-2">
+          <div class="form-row"><label>开始时间(HH:MM)</label><input id="set-silent-start" placeholder="00:00"></div>
+          <div class="form-row"><label>结束时间(HH:MM)</label><input id="set-silent-end" placeholder="07:00"></div>
+        </div>
+        <div class="hint">静默窗口内漏洞照常入库,只是不推送,避免夜间打扰</div>
+      </div>
+      <div class="card">
+        <h2>🤖 DeepSeek(可选增强)</h2>
+        <div class="form-row"><label>API Key</label><input id="set-ds-key" style="width:100%" placeholder="sk-..."></div>
+        <div class="hint">填入后系统可对重要漏洞生成中文摘要;留空则跳过,不影响主链路</div>
+      </div>
+      <div class="card">
+        <h2>⏰ 定时任务</h2>
+        <div class="form-row"><label>每日汇总时间(HH:MM)</label><input id="set-time" placeholder="09:00"></div>
+        <div class="hint">通过环境变量 VULNWATCH_DAILY_HOUR / VULNWATCH_DAILY_MINUTE 设置,重启生效</div>
+      </div>
+      <div class="toolbar">
+        <button class="btn" onclick="saveSettings()">保存全部配置</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const API = '';
+let allVulns = [];
+
+// 访问口令:服务端设置 VULNWATCH_AUTH_TOKEN 后,此处需填入相同口令。
+// 优先从 localStorage 读取;未配置则匿名访问。
+function getToken() { return localStorage.getItem('vulnwatch_token') || ''; }
+function authHeaders() {
+  const t = getToken();
+  return t ? { 'Authorization': 'Bearer ' + t } : {};
+}
+function withToken(url) {
+  const t = getToken();
+  if (!t) return url;
+  return url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(t);
+}
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+// 未授权时弹出输入框让用户填写口令
+async function promptToken() {
+  const t = prompt('访问受保护,请输入访问口令(服务端 VULNWATCH_AUTH_TOKEN):');
+  if (t === null) return false;
+  localStorage.setItem('vulnwatch_token', t);
+  return true;
+}
+
+// 导航
+document.querySelectorAll('.nav-item').forEach(item => {
+  item.addEventListener('click', () => {
+    document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    item.classList.add('active');
+    document.getElementById('page-' + item.dataset.page).classList.add('active');
+    if (item.dataset.page === 'dashboard') loadDashboard();
+    if (item.dataset.page === 'vulns') loadVulns();
+    if (item.dataset.page === 'sources') loadSources();
+    if (item.dataset.page === 'settings') loadSettings();
+  });
+});
+
+async function get(url) {
+  const r = await fetch(withToken(API + url), { headers: authHeaders() });
+  if (r.status === 401) {
+    localStorage.removeItem('vulnwatch_token');
+    if (await promptToken()) return get(url);
+    return { items: [], total: 0 };
+  }
+  return r.json();
+}
+
+async function send(method, url, body) {
+  const headers = { 'Content-Type': 'application/json', ...authHeaders() };
+  const r = await fetch(withToken(API + url), { method, headers, body: body ? JSON.stringify(body) : undefined });
+  if (r.status === 401) {
+    localStorage.removeItem('vulnwatch_token');
+    if (await promptToken()) return send(method, url, body);
+    return null;
+  }
+  return r.json();
+}
+
+function sevBadge(s, kev) {
+  if (kev) return '<span class="badge kev">🚨 在野利用</span>';
+  const map = {CRITICAL:'critical',HIGH:'high',MEDIUM:'medium',LOW:'low',UNKNOWN:'unknown'};
+  const label = {CRITICAL:'严重',HIGH:'高危',MEDIUM:'中危',LOW:'低危',UNKNOWN:'未知'};
+  return `<span class="badge ${map[s]||'unknown'}">${label[s]||s}</span>`;
+}
+
+async function loadDashboard() {
+  const d = await get('/api/vulnerabilities?days=7&limit=1');
+  const total = d.total;
+  const dk = await get('/api/vulnerabilities?days=7&limit=1&is_kev=true');
+  const dc = await get('/api/vulnerabilities?days=7&limit=1&severity=CRITICAL');
+  const dh = await get('/api/vulnerabilities?days=7&limit=1&severity=HIGH');
+  document.getElementById('stat-total').textContent = total;
+  document.getElementById('stat-critical').textContent = dc.total;
+  document.getElementById('stat-high').textContent = dh.total;
+  document.getElementById('stat-kev').textContent = dk.total;
+}
+
+async function loadVulns() {
+  const sev = document.getElementById('f-severity').value;
+  const kw = document.getElementById('f-keyword').value;
+  const kev = document.getElementById('f-kev').checked;
+  const days = document.getElementById('f-days').value;
+  let q = `/api/vulnerabilities?days=${days}&limit=200`;
+  if (sev) q += `&severity=${sev}`;
+  if (kw) q += `&keyword=${encodeURIComponent(kw)}`;
+  if (kev) q += `&is_kev=true`;
+  const d = await get(q);
+  allVulns = d.items;
+  const tbody = document.getElementById('vuln-tbody');
+  const empty = document.getElementById('vuln-empty');
+  if (!d.items.length) { tbody.innerHTML=''; empty.style.display='block'; return; }
+  empty.style.display='none';
+  tbody.innerHTML = d.items.map(v => `
+    <tr>
+      <td>${sevBadge(v.severity, v.is_kev)}</td>
+      <td><b>${v.cve_id || '公告'}</b><br><span style="color:var(--muted);font-size:12px">${esc(v.title).slice(0,80)}</span>${v.tags ? `<br><span style="font-size:11px;color:var(--primary)">${esc(v.tags).split(',').slice(0,4).join(' · ')}</span>` : ''}</td>
+      <td>${v.cvss_score ?? '-'}</td>
+      <td style="color:var(--muted)">${esc(v.source_name || '')}</td>
+      <td style="color:var(--muted);font-size:12px">${v.published_at ? v.published_at.slice(0,10) : '-'}</td>
+      <td>${safeLink(v.url)}</td>
+    </tr>`).join('');
+}
+
+function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// 安全链接:仅允许 http/https,其余(如 javascript:)降级为纯文本,防 XSS
+function safeLink(url) {
+  if (!url) return '-';
+  if (!/^https?:\/\//i.test(url)) return esc(url);
+  return `<a class="link" href="${esc(url)}" target="_blank" rel="noopener noreferrer">详情</a>`;
+}
+
+async function loadSources() {
+  const d = await get('/api/sources');
+  const tbody = document.getElementById('source-tbody');
+  tbody.innerHTML = d.map(s => `
+    <tr>
+      <td><b>${esc(s.name)}</b></td>
+      <td>${esc(s.category)}</td>
+      <td><span class="badge unknown">${esc(s.source_type)}</span></td>
+      <td style="font-size:12px;color:var(--muted)">${esc(s.cpe || s.keyword || '-')}</td>
+      <td>${s.enabled ? '<span class="badge low">启用</span>' : '<span class="badge unknown">停用</span>'}</td>
+      <td>
+        <button class="btn small secondary" onclick="collectOne(${s.id})">采集</button>
+        <button class="btn small secondary" onclick="editSource(${s.id})">编辑</button>
+        <button class="btn small danger" onclick="delSource(${s.id})">删除</button>
+      </td>
+    </tr>`).join('');
+}
+
+function showSourceForm() {
+  document.getElementById('source-form').style.display = 'block';
+  document.getElementById('source-form-title').textContent = '新增监控源';
+  document.getElementById('s-id').value = '';
+  document.getElementById('s-name').value = '';
+  document.getElementById('s-url').value = '';
+  document.getElementById('s-cpe').value = '';
+  document.getElementById('s-kw').value = '';
+  document.getElementById('s-enabled').checked = true;
+  onTypeChange();
+}
+
+function hideSourceForm() { document.getElementById('source-form').style.display = 'none'; }
+
+function onTypeChange() {
+  const t = document.getElementById('s-type').value;
+  document.getElementById('s-cpe-row').style.display = t === 'nvd_cpe' ? 'block' : 'none';
+  document.getElementById('s-kw-row').style.display = (t === 'rss' || t === 'nvd_cpe') ? 'block' : 'none';
+}
+
+async function editSource(id) {
+  const d = await get('/api/sources');
+  const s = d.find(x => x.id === id);
+  if (!s) return;
+  showSourceForm();
+  document.getElementById('source-form-title').textContent = '编辑监控源';
+  document.getElementById('s-id').value = s.id;
+  document.getElementById('s-name').value = s.name;
+  document.getElementById('s-category').value = s.category;
+  document.getElementById('s-type').value = s.source_type;
+  document.getElementById('s-url').value = s.url;
+  document.getElementById('s-cpe').value = s.cpe || '';
+  document.getElementById('s-kw').value = s.keyword || '';
+  document.getElementById('s-enabled').checked = s.enabled;
+  onTypeChange();
+}
+
+async function saveSource() {
+  const id = document.getElementById('s-id').value;
+  const body = {
+    name: document.getElementById('s-name').value,
+    category: document.getElementById('s-category').value,
+    source_type: document.getElementById('s-type').value,
+    url: document.getElementById('s-url').value,
+    cpe: document.getElementById('s-cpe').value || null,
+    keyword: document.getElementById('s-kw').value || null,
+    enabled: document.getElementById('s-enabled').checked,
+  };
+  if (!body.name || !body.url) { toast('请填写名称和 URL'); return; }
+  if (id) {
+    await send('PUT', `/api/sources/${id}`, body);
+  } else {
+    await send('POST', `/api/sources`, body);
+  }
+  toast('已保存'); hideSourceForm(); loadSources();
+}
+
+async function delSource(id) {
+  if (!confirm('确认删除该监控源?相关漏洞记录也会删除')) return;
+  await send('DELETE', `/api/sources/${id}`);
+  toast('已删除'); loadSources();
+}
+
+async function doCollectAll() {
+  toast('开始采集,请等待...');
+  document.getElementById('collect-result').textContent = '采集进行中...';
+  const d = await send('POST', `/api/collect`);
+  const results = (d && d.results) || [];
+  document.getElementById('collect-result').innerHTML =
+    results.map(x => `<div>${esc(x.source_name)}: 获取 ${x.fetched} 条,新增 ${x.new_count} 条 ${x.error ? '⚠️ '+esc(x.error) : ''}</div>`).join('');
+  toast('采集完成');
+  loadDashboard();
+}
+
+async function collectOne(id) {
+  toast('采集该源中...');
+  const d = await send('POST', `/api/collect/${id}`);
+  if (!d) { toast('采集失败(可能未授权)'); return; }
+  toast(`${d.source_name}: 获取 ${d.fetched}, 新增 ${d.new_count}${d.error ? ' 失败:'+d.error : ''}`);
+  loadDashboard();
+}
+
+async function loadSettings() {
+  const d = await get('/api/settings');
+  document.getElementById('set-webhook').value = d.dingtalk_webhook || '';
+  document.getElementById('set-secret').value = d.dingtalk_secret || '';
+  document.getElementById('set-channel').value = d.notify_channel || 'dingtalk';
+  document.getElementById('set-wecom-webhook').value = d.wecom_webhook || '';
+  document.getElementById('set-feishu-webhook').value = d.feishu_webhook || '';
+  document.getElementById('set-serverchan-sendkey').value = d.serverchan_sendkey || '';
+  document.getElementById('set-pushplus-token').value = d.pushplus_token || '';
+  document.getElementById('set-threshold').value = d.alert_threshold || 'HIGH';
+  document.getElementById('set-include').value = d.include_keywords || '';
+  document.getElementById('set-exclude').value = d.exclude_keywords || '';
+  document.getElementById('set-required-tags').value = d.required_tags || '';
+  document.getElementById('set-silent-enabled').checked = (d.silent_hours_enabled || '').toLowerCase() === 'true';
+  document.getElementById('set-silent-start').value = d.silent_hours_start || '00:00';
+  document.getElementById('set-silent-end').value = d.silent_hours_end || '07:00';
+  document.getElementById('set-ds-key').value = d.deepseek_api_key || '';
+  document.getElementById('set-time').value = d.daily_time || '09:00';
+  onChannelChange();
+}
+
+function onChannelChange() {
+  // 高亮当前通道对应凭证输入框(纯 UI 提示,可选)
+  const ch = document.getElementById('set-channel').value;
+  ['set-webhook','set-secret','set-wecom-webhook','set-feishu-webhook','set-serverchan-sendkey','set-pushplus-token'].forEach(id => {
+    document.getElementById(id).style.borderColor = '';
+  });
+  const map = {
+    dingtalk: ['set-webhook','set-secret'],
+    wecom: ['set-wecom-webhook'],
+    feishu: ['set-feishu-webhook'],
+    serverchan: ['set-serverchan-sendkey'],
+    pushplus: ['set-pushplus-token'],
+  };
+  (map[ch] || []).forEach(id => { document.getElementById(id).style.borderColor = 'var(--primary)'; });
+}
+
+async function saveSettings() {
+  const kv = {
+    notify_channel: document.getElementById('set-channel').value,
+    dingtalk_webhook: document.getElementById('set-webhook').value,
+    dingtalk_secret: document.getElementById('set-secret').value,
+    wecom_webhook: document.getElementById('set-wecom-webhook').value,
+    feishu_webhook: document.getElementById('set-feishu-webhook').value,
+    serverchan_sendkey: document.getElementById('set-serverchan-sendkey').value,
+    pushplus_token: document.getElementById('set-pushplus-token').value,
+    alert_threshold: document.getElementById('set-threshold').value,
+    include_keywords: document.getElementById('set-include').value,
+    exclude_keywords: document.getElementById('set-exclude').value,
+    required_tags: document.getElementById('set-required-tags').value,
+    silent_hours_enabled: document.getElementById('set-silent-enabled').checked ? 'true' : 'false',
+    silent_hours_start: document.getElementById('set-silent-start').value,
+    silent_hours_end: document.getElementById('set-silent-end').value,
+    deepseek_api_key: document.getElementById('set-ds-key').value,
+  };
+  for (const [k, v] of Object.entries(kv)) {
+    await send('PUT', `/api/settings/${k}`, { value: v });
+  }
+  toast('配置已保存');
+}
+
+async function testNotify() {
+  await saveSettings();
+  const res = await send('POST', `/api/test-notify`);
+  const el = document.getElementById('test-result');
+  if (!res) { el.textContent = '❌ 发送失败'; return; }
+  if (res.ok) { el.textContent = `✅ 发送成功(通道:${res.channel})`; }
+  else { el.textContent = `❌ 发送失败:${res.msg || ''}`; }
+}
+
+// 兼容旧函数名
+async function testDingTalk() { return testNotify(); }
+
+loadDashboard();
+loadSources();
+loadSettings();
+</script>
+</body>
+</html>

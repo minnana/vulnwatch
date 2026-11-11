@@ -1,0 +1,15 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+data/
+.env
+
+# WorkBuddy 项目数据目录(含记忆/日志,不公开)
+.workbuddy/
+
+# 日志与临时文件
+*.log
+*.db-shm
+*.db-wal
+/tmp/

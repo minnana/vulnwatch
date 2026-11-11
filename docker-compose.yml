@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  vulnwatch:
+    build: .
+    container_name: vulnwatch
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+      - VULNWATCH_DAILY_HOUR=9
+      - VULNWATCH_DAILY_MINUTE=0
