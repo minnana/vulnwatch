@@ -85,7 +85,7 @@ class VenustechCollector(BaseCollector):
         disclosure = self._cell(html, "发现时间")
         level = self._cell(html, "漏洞等级") or self._cell(html, "等级")
 
-        severity_map = {"高危": "HIGH", "中危": "MEDIUM", "低危": "LOW"}
+        severity_map = {"严重": "CRITICAL", "紧急": "CRITICAL", "高危": "HIGH", "中危": "MEDIUM", "低危": "LOW"}
         severity = severity_map.get(level, "UNKNOWN")
 
         # 过滤:仅高危/严重

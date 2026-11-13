@@ -1,15 +1,23 @@
+# 虚拟环境
 .venv/
 venv/
+
+# Python 缓存
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+
+# 运行数据(SQLite 数据库、日志)
 data/
-.env
-
-# WorkBuddy 项目数据目录(含记忆/日志,不公开)
-.workbuddy/
-
-# 日志与临时文件
-*.log
+*.db
 *.db-shm
 *.db-wal
-/tmp/
+*.log
+
+# 本地配置/密钥
+.env
+
+# 工具与系统文件
+.workbuddy/
+.DS_Store
+Thumbs.db

@@ -5,7 +5,7 @@
 """
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List
 
 from .base import BaseCollector
@@ -95,7 +95,11 @@ class OscsCollector(BaseCollector):
             cve_id = detail.get("cve_id")
             title = detail.get("title") or title
             description = detail.get("description")
-            severity = detail.get("severity", severity)
+            # 详情接口对未知等级会返回 "UNKNOWN"(非空),不能直接覆盖列表页已判定的
+            # HIGH/CRITICAL,否则这些条目会在下面的过滤里被丢弃。
+            detail_severity = detail.get("severity")
+            if detail_severity in ("HIGH", "CRITICAL"):
+                severity = detail_severity
             cvss = detail.get("cvss_score")
             published = detail.get("published_at")
             affected = detail.get("affected")
@@ -144,7 +148,11 @@ class OscsCollector(BaseCollector):
         pub_ms = d.get("publish_time")
         if pub_ms:
             try:
-                published = datetime.fromtimestamp(int(pub_ms) / 1000)
+                # 原实现用 fromtimestamp(本地时区)但库里统一存 UTC,
+                # 在中国时区会偏移 8 小时,导致"最近 N 天"过滤漏数据,这里改为 UTC。
+                published = datetime.fromtimestamp(
+                    int(pub_ms) / 1000, tz=timezone.utc
+                ).replace(tzinfo=None)
             except (ValueError, TypeError, OSError):
                 published = None
 
@@ -155,8 +163,8 @@ class OscsCollector(BaseCollector):
             affected = "; ".join(sorted(names))
 
         return {
-            "cve_id": d.get("cve_id") or d.get("vuln_cve_id"),
-            "title": d.get("vuln_title") or d.get("title"),
+            "cve_id": d.get("cve_id"),
+            "title": d.get("title"),
             "description": d.get("description"),
             "severity": severity,
             "cvss_score": d.get("cvss_score"),

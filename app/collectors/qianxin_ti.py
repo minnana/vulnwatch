@@ -39,7 +39,7 @@ class QianxinTiCollector(BaseCollector):
         severity_map = {"低危": "LOW", "中危": "MEDIUM", "高危": "HIGH", "极危": "CRITICAL"}
         severity = severity_map.get(d.get("rating_level"), "UNKNOWN")
 
-        tags = [t.get("name", "").strip() for t in d.get("tag", [])]
+        tags = [t.get("name", "").strip() for t in (d.get("tag") or [])]
         tags = [t for t in tags if t]
 
         # 过滤:高危/极危 且 含指定标签之一

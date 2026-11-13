@@ -5,6 +5,7 @@
 from datetime import datetime, timedelta
 from typing import List
 
+from .. import config
 from .base import BaseCollector
 
 API = "https://x.threatbook.com/v5/node/vul_module/homePage"
@@ -61,7 +62,7 @@ class ThreatbookCollector(BaseCollector):
             upd = datetime.strptime(update, "%Y-%m-%d")
         except (ValueError, TypeError):
             upd = dis
-        if datetime.utcnow() - upd > timedelta(days=30):
+        if config.utcnow() - upd > timedelta(days=30):
             return None
 
         return {
@@ -73,7 +74,8 @@ class ThreatbookCollector(BaseCollector):
             "cvss_score": None,
             "affected": "; ".join(v.get("affects") or []) or None,
             "tags": ",".join(tags) if tags else None,
-            "url": f"https://x.threatbook.com/v5/vul/{v.get('id')}",
+            "url": (f"https://x.threatbook.com/v5/vul/{v.get('id')}"
+                    if v.get("id") else "https://x.threatbook.com/v5/vulIntelligence"),
             "published_at": dis,
             "is_kev": False,
         }

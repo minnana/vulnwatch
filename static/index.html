@@ -58,6 +58,7 @@
     background: var(--primary); color: #fff; text-decoration: none;
   }
   .btn:hover { background: var(--primary-hover); }
+  .btn:disabled { opacity: .6; cursor: not-allowed; }
   .btn.secondary { background: #fff; color: var(--text); border: 1px solid var(--border); }
   .btn.secondary:hover { background: #f3f4f6; }
   .btn.danger { background: var(--red); }
@@ -85,12 +86,14 @@
   .toast {
     position: fixed; top: 20px; right: 20px; background: #111827; color: #fff;
     padding: 12px 20px; border-radius: 8px; z-index: 999; opacity: 0; transition: opacity .3s;
+    pointer-events: none;
   }
   .toast.show { opacity: 1; }
   .page { display: none; }
   .page.active { display: block; }
   .link { color: var(--primary); text-decoration: none; }
   .empty { text-align: center; color: var(--muted); padding: 40px 0; }
+  .collect-line { padding: 2px 0; }
 </style>
 </head>
 <body>
@@ -106,7 +109,7 @@
     <!-- 概览 -->
     <div class="page active" id="page-dashboard">
       <h1>漏洞情报概览</h1>
-      <p class="subtitle">系统自动采集官方安全公告,重要漏洞高亮并推送钉钉</p>
+      <p class="subtitle">系统自动采集官方安全公告,重要漏洞高亮并推送</p>
       <div class="card">
         <div class="grid-2" style="grid-template-columns:repeat(4,1fr)">
           <div class="stat-box"><div class="num" id="stat-total" style="color:var(--primary)">-</div><div class="label">漏洞总数(近7天)</div></div>
@@ -117,8 +120,8 @@
       </div>
       <div class="card">
         <div class="toolbar">
-          <button class="btn" onclick="doCollectAll()">🔄 立即采集</button>
-          <span class="hint">手动触发一次全量采集(每个源间有间隔,请耐心等待)</span>
+          <button class="btn" id="collect-btn" onclick="doCollectAll()">🔄 立即采集</button>
+          <span class="hint">手动触发一次全量采集(后台运行,可离开本页)</span>
         </div>
         <div id="collect-result" class="hint"></div>
       </div>
@@ -280,12 +283,12 @@
       <div class="card">
         <h2>🤖 DeepSeek(可选增强)</h2>
         <div class="form-row"><label>API Key</label><input id="set-ds-key" style="width:100%" placeholder="sk-..."></div>
-        <div class="hint">填入后系统可对重要漏洞生成中文摘要;留空则跳过,不影响主链路</div>
+        <div class="hint">填入后,每日推送里排名靠前的漏洞会自动生成中文摘要;留空则跳过,不影响主链路</div>
       </div>
       <div class="card">
         <h2>⏰ 定时任务</h2>
         <div class="form-row"><label>每日汇总时间(HH:MM)</label><input id="set-time" placeholder="09:00"></div>
-        <div class="hint">通过环境变量 VULNWATCH_DAILY_HOUR / VULNWATCH_DAILY_MINUTE 设置,重启生效</div>
+        <div class="hint">保存后立即生效(无需重启);时区由 VULNWATCH_TIMEZONE 控制,默认 Asia/Shanghai</div>
       </div>
       <div class="toolbar">
         <button class="btn" onclick="saveSettings()">保存全部配置</button>
@@ -298,18 +301,27 @@
 <script>
 const API = '';
 let allVulns = [];
+let collectTimer = null;
 
-// 访问口令:服务端设置 VULNWATCH_AUTH_TOKEN 后,此处需填入相同口令。
-// 优先从 localStorage 读取;未配置则匿名访问。
+// ---------- 访问口令 ----------
+// 支持三种来源:URL 的 ?token= (首次打开时自动存入并在地址栏去掉)、localStorage、手动输入。
+(function bootstrapToken() {
+  try {
+    const params = new URLSearchParams(location.search);
+    const urlToken = params.get('token');
+    if (urlToken) {
+      localStorage.setItem('vulnwatch_token', urlToken);
+      params.delete('token');
+      const qs = params.toString();
+      history.replaceState(null, '', location.pathname + (qs ? '?' + qs : '') + location.hash);
+    }
+  } catch (e) { /* 忽略:老浏览器或 file:// 打开 */ }
+})();
+
 function getToken() { return localStorage.getItem('vulnwatch_token') || ''; }
 function authHeaders() {
   const t = getToken();
   return t ? { 'Authorization': 'Bearer ' + t } : {};
-}
-function withToken(url) {
-  const t = getToken();
-  if (!t) return url;
-  return url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(t);
 }
 
 function toast(msg) {
@@ -326,7 +338,38 @@ async function promptToken() {
   return true;
 }
 
-// 导航
+// 统一请求封装:非 2xx 抛错(便于统一 toast),401 时提示口令后重试一次
+async function api(method, url, body) {
+  const headers = Object.assign(
+    body !== undefined ? { 'Content-Type': 'application/json' } : {},
+    authHeaders()
+  );
+  const resp = await fetch(API + url, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  if (resp.status === 401) {
+    localStorage.removeItem('vulnwatch_token');
+    if (await promptToken()) return api(method, url, body);
+    throw new Error('未授权:口令缺失或错误');
+  }
+  let data = null;
+  try { data = await resp.json(); } catch (e) { data = null; }
+  if (!resp.ok) {
+    const detail = data && data.detail;
+    const msg = Array.isArray(detail)
+      ? detail.map(d => d.msg || JSON.stringify(d)).join('; ')
+      : (detail || (data && data.msg) || ('HTTP ' + resp.status));
+    throw new Error(msg);
+  }
+  return data;
+}
+
+const get = (url) => api('GET', url);
+const send = (method, url, body) => api(method, url, body);
+
+// ---------- 导航 ----------
 document.querySelectorAll('.nav-item').forEach(item => {
   item.addEventListener('click', () => {
     document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
@@ -340,73 +383,18 @@ document.querySelectorAll('.nav-item').forEach(item => {
   });
 });
 
-async function get(url) {
-  const r = await fetch(withToken(API + url), { headers: authHeaders() });
-  if (r.status === 401) {
-    localStorage.removeItem('vulnwatch_token');
-    if (await promptToken()) return get(url);
-    return { items: [], total: 0 };
-  }
-  return r.json();
-}
-
-async function send(method, url, body) {
-  const headers = { 'Content-Type': 'application/json', ...authHeaders() };
-  const r = await fetch(withToken(API + url), { method, headers, body: body ? JSON.stringify(body) : undefined });
-  if (r.status === 401) {
-    localStorage.removeItem('vulnwatch_token');
-    if (await promptToken()) return send(method, url, body);
-    return null;
-  }
-  return r.json();
-}
-
 function sevBadge(s, kev) {
   if (kev) return '<span class="badge kev">🚨 在野利用</span>';
   const map = {CRITICAL:'critical',HIGH:'high',MEDIUM:'medium',LOW:'low',UNKNOWN:'unknown'};
   const label = {CRITICAL:'严重',HIGH:'高危',MEDIUM:'中危',LOW:'低危',UNKNOWN:'未知'};
-  return `<span class="badge ${map[s]||'unknown'}">${label[s]||s}</span>`;
+  return `<span class="badge ${map[s]||'unknown'}">${label[s]||esc(s||'')}</span>`;
 }
 
-async function loadDashboard() {
-  const d = await get('/api/vulnerabilities?days=7&limit=1');
-  const total = d.total;
-  const dk = await get('/api/vulnerabilities?days=7&limit=1&is_kev=true');
-  const dc = await get('/api/vulnerabilities?days=7&limit=1&severity=CRITICAL');
-  const dh = await get('/api/vulnerabilities?days=7&limit=1&severity=HIGH');
-  document.getElementById('stat-total').textContent = total;
-  document.getElementById('stat-critical').textContent = dc.total;
-  document.getElementById('stat-high').textContent = dh.total;
-  document.getElementById('stat-kev').textContent = dk.total;
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
 }
-
-async function loadVulns() {
-  const sev = document.getElementById('f-severity').value;
-  const kw = document.getElementById('f-keyword').value;
-  const kev = document.getElementById('f-kev').checked;
-  const days = document.getElementById('f-days').value;
-  let q = `/api/vulnerabilities?days=${days}&limit=200`;
-  if (sev) q += `&severity=${sev}`;
-  if (kw) q += `&keyword=${encodeURIComponent(kw)}`;
-  if (kev) q += `&is_kev=true`;
-  const d = await get(q);
-  allVulns = d.items;
-  const tbody = document.getElementById('vuln-tbody');
-  const empty = document.getElementById('vuln-empty');
-  if (!d.items.length) { tbody.innerHTML=''; empty.style.display='block'; return; }
-  empty.style.display='none';
-  tbody.innerHTML = d.items.map(v => `
-    <tr>
-      <td>${sevBadge(v.severity, v.is_kev)}</td>
-      <td><b>${v.cve_id || '公告'}</b><br><span style="color:var(--muted);font-size:12px">${esc(v.title).slice(0,80)}</span>${v.tags ? `<br><span style="font-size:11px;color:var(--primary)">${esc(v.tags).split(',').slice(0,4).join(' · ')}</span>` : ''}</td>
-      <td>${v.cvss_score ?? '-'}</td>
-      <td style="color:var(--muted)">${esc(v.source_name || '')}</td>
-      <td style="color:var(--muted);font-size:12px">${v.published_at ? v.published_at.slice(0,10) : '-'}</td>
-      <td>${safeLink(v.url)}</td>
-    </tr>`).join('');
-}
-
-function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 // 安全链接:仅允许 http/https,其余(如 javascript:)降级为纯文本,防 XSS
 function safeLink(url) {
@@ -415,8 +403,52 @@ function safeLink(url) {
   return `<a class="link" href="${esc(url)}" target="_blank" rel="noopener noreferrer">详情</a>`;
 }
 
+// ---------- 概览 ----------
+async function loadDashboard() {
+  try {
+    const d = await get('/api/stats?days=7');
+    document.getElementById('stat-total').textContent = d.total;
+    document.getElementById('stat-critical').textContent = d.critical;
+    document.getElementById('stat-high').textContent = d.high;
+    document.getElementById('stat-kev').textContent = d.kev;
+  } catch (e) {
+    toast('加载概览失败: ' + e.message);
+  }
+}
+
+// ---------- 漏洞列表 ----------
+async function loadVulns() {
+  const sev = document.getElementById('f-severity').value;
+  const kw = document.getElementById('f-keyword').value;
+  const kev = document.getElementById('f-kev').checked;
+  const days = document.getElementById('f-days').value;
+  let q = `/api/vulnerabilities?days=${encodeURIComponent(days)}&limit=200`;
+  if (sev) q += `&severity=${encodeURIComponent(sev)}`;
+  if (kw) q += `&keyword=${encodeURIComponent(kw)}`;
+  if (kev) q += `&is_kev=true`;
+
+  let d;
+  try { d = await get(q); } catch (e) { toast('查询失败: ' + e.message); return; }
+  allVulns = d.items || [];
+  const tbody = document.getElementById('vuln-tbody');
+  const empty = document.getElementById('vuln-empty');
+  if (!allVulns.length) { tbody.innerHTML = ''; empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+  tbody.innerHTML = allVulns.map(v => `
+    <tr>
+      <td>${sevBadge(v.severity, v.is_kev)}</td>
+      <td><b>${esc(v.cve_id || v.unique_key || '公告')}</b><br><span style="color:var(--muted);font-size:12px">${esc((v.title || '').slice(0,80))}</span>${v.tags ? `<br><span style="font-size:11px;color:var(--primary)">${esc(v.tags).split(',').slice(0,4).join(' · ')}</span>` : ''}${v.ai_summary ? `<br><span style="font-size:12px;color:var(--muted)">🤖 ${esc(v.ai_summary)}</span>` : ''}</td>
+      <td>${esc(v.cvss_score ?? '-')}</td>
+      <td style="color:var(--muted)">${esc(v.source_name || '')}</td>
+      <td style="color:var(--muted);font-size:12px">${v.published_at ? esc(v.published_at.slice(0,10)) : '-'}</td>
+      <td>${safeLink(v.url)}</td>
+    </tr>`).join('');
+}
+
+// ---------- 监控源 ----------
 async function loadSources() {
-  const d = await get('/api/sources');
+  let d;
+  try { d = await get('/api/sources'); } catch (e) { toast('加载监控源失败: ' + e.message); return; }
   const tbody = document.getElementById('source-tbody');
   tbody.innerHTML = d.map(s => `
     <tr>
@@ -442,6 +474,9 @@ function showSourceForm() {
   document.getElementById('s-cpe').value = '';
   document.getElementById('s-kw').value = '';
   document.getElementById('s-enabled').checked = true;
+  // 重置下拉框,否则新增时会沿用上一次「编辑」留下的类别/采集类型
+  document.getElementById('s-category').value = 'OS';
+  document.getElementById('s-type').value = 'nvd_cpe';
   onTypeChange();
 }
 
@@ -454,8 +489,9 @@ function onTypeChange() {
 }
 
 async function editSource(id) {
-  const d = await get('/api/sources');
-  const s = d.find(x => x.id === id);
+  let d;
+  try { d = await get('/api/sources'); } catch (e) { toast('加载失败: ' + e.message); return; }
+  const s = (d || []).find(x => x.id === id);
   if (!s) return;
   showSourceForm();
   document.getElementById('source-form-title').textContent = '编辑监控源';
@@ -482,41 +518,98 @@ async function saveSource() {
     enabled: document.getElementById('s-enabled').checked,
   };
   if (!body.name || !body.url) { toast('请填写名称和 URL'); return; }
-  if (id) {
-    await send('PUT', `/api/sources/${id}`, body);
-  } else {
-    await send('POST', `/api/sources`, body);
-  }
+  try {
+    if (id) await send('PUT', `/api/sources/${id}`, body);
+    else await send('POST', '/api/sources', body);
+  } catch (e) { toast('保存失败: ' + e.message); return; }
   toast('已保存'); hideSourceForm(); loadSources();
 }
 
 async function delSource(id) {
   if (!confirm('确认删除该监控源?相关漏洞记录也会删除')) return;
-  await send('DELETE', `/api/sources/${id}`);
+  try { await send('DELETE', `/api/sources/${id}`); } catch (e) { toast('删除失败: ' + e.message); return; }
   toast('已删除'); loadSources();
 }
 
+// ---------- 采集(后台任务 + 轮询) ----------
 async function doCollectAll() {
-  toast('开始采集,请等待...');
-  document.getElementById('collect-result').textContent = '采集进行中...';
-  const d = await send('POST', `/api/collect`);
-  const results = (d && d.results) || [];
-  document.getElementById('collect-result').innerHTML =
-    results.map(x => `<div>${esc(x.source_name)}: 获取 ${x.fetched} 条,新增 ${x.new_count} 条 ${x.error ? '⚠️ '+esc(x.error) : ''}</div>`).join('');
-  toast('采集完成');
+  const btn = document.getElementById('collect-btn');
+  const out = document.getElementById('collect-result');
+  btn.disabled = true;
+  out.textContent = '采集任务已提交,正在后台运行…';
+  try {
+    await send('POST', '/api/collect');
+  } catch (e) {
+    // 409:已有采集任务在跑(例如定时任务),继续轮询它的进度而不是直接报错
+    if (String(e.message || '').includes('正在运行')) {
+      out.textContent = '已有采集任务在运行,正在显示进度…';
+      startCollectPolling();
+      return;
+    }
+    out.textContent = '❌ ' + e.message;
+    btn.disabled = false;
+    return;
+  }
+  toast('开始采集');
+  startCollectPolling();
+}
+
+function startCollectPolling() {
+  stopCollectPolling();
+  collectTimer = setInterval(pollCollectStatus, 2000);
+  pollCollectStatus();
+}
+
+function stopCollectPolling() {
+  if (collectTimer) { clearInterval(collectTimer); collectTimer = null; }
+}
+
+async function pollCollectStatus() {
+  const btn = document.getElementById('collect-btn');
+  const out = document.getElementById('collect-result');
+  let d;
+  try {
+    d = await get('/api/collect/status');
+  } catch (e) {
+    stopCollectPolling();
+    if (btn) btn.disabled = false;
+    out.textContent = '❌ 状态获取失败: ' + e.message;
+    toast('状态获取失败: ' + e.message);
+    return;
+  }
+  const results = d.results || [];
+  const lines = results.map(x =>
+    `<div class="collect-line">${esc(x.source_name)}: 获取 ${x.fetched} 条,新增 ${x.new_count} 条${x.error ? ' ⚠️ ' + esc(x.error) : ''}</div>`
+  );
+  if (d.running) {
+    lines.push(`<div class="collect-line" style="color:var(--muted)">已完成 ${results.length} 个源,采集中…</div>`);
+  } else if (d.error) {
+    lines.push(`<div class="collect-line" style="color:var(--red)">采集失败: ${esc(d.error)}</div>`);
+  }
+  out.innerHTML = lines.join('');
+  if (btn) btn.disabled = !!d.running;
+  if (d.running) return;
+
+  stopCollectPolling();
+  if (results.length) toast('采集完成');
   loadDashboard();
+  if (document.getElementById('page-vulns').classList.contains('active')) loadVulns();
 }
 
 async function collectOne(id) {
-  toast('采集该源中...');
-  const d = await send('POST', `/api/collect/${id}`);
-  if (!d) { toast('采集失败(可能未授权)'); return; }
-  toast(`${d.source_name}: 获取 ${d.fetched}, 新增 ${d.new_count}${d.error ? ' 失败:'+d.error : ''}`);
+  toast('采集该源中…');
+  let d;
+  try { d = await send('POST', `/api/collect/${id}`); }
+  catch (e) { toast('采集失败: ' + e.message); return; }
+  if (!d) { toast('采集失败'); return; }
+  toast(`${d.source_name}: 获取 ${d.fetched} 条, 新增 ${d.new_count} 条${d.error ? ' 失败:' + d.error : ''}`);
   loadDashboard();
 }
 
+// ---------- 配置 ----------
 async function loadSettings() {
-  const d = await get('/api/settings');
+  let d;
+  try { d = await get('/api/settings'); } catch (e) { toast('加载配置失败: ' + e.message); return; }
   document.getElementById('set-webhook').value = d.dingtalk_webhook || '';
   document.getElementById('set-secret').value = d.dingtalk_secret || '';
   document.getElementById('set-channel').value = d.notify_channel || 'dingtalk';
@@ -537,7 +630,6 @@ async function loadSettings() {
 }
 
 function onChannelChange() {
-  // 高亮当前通道对应凭证输入框(纯 UI 提示,可选)
   const ch = document.getElementById('set-channel').value;
   ['set-webhook','set-secret','set-wecom-webhook','set-feishu-webhook','set-serverchan-sendkey','set-pushplus-token'].forEach(id => {
     document.getElementById(id).style.borderColor = '';
@@ -552,8 +644,8 @@ function onChannelChange() {
   (map[ch] || []).forEach(id => { document.getElementById(id).style.borderColor = 'var(--primary)'; });
 }
 
-async function saveSettings() {
-  const kv = {
+function collectSettings() {
+  return {
     notify_channel: document.getElementById('set-channel').value,
     dingtalk_webhook: document.getElementById('set-webhook').value,
     dingtalk_secret: document.getElementById('set-secret').value,
@@ -569,28 +661,49 @@ async function saveSettings() {
     silent_hours_start: document.getElementById('set-silent-start').value,
     silent_hours_end: document.getElementById('set-silent-end').value,
     deepseek_api_key: document.getElementById('set-ds-key').value,
+    daily_time: document.getElementById('set-time').value,
   };
-  for (const [k, v] of Object.entries(kv)) {
-    await send('PUT', `/api/settings/${k}`, { value: v });
-  }
+}
+
+async function saveSettings() {
+  const values = collectSettings();
+  // 时间留空表示沿用后端默认时间:不提交该项,避免整批配置被 400 拒绝
+  if (!String(values.daily_time || '').trim()) delete values.daily_time;
+  try {
+    await send('PUT', '/api/settings', { values });
+  } catch (e) { toast('保存失败: ' + e.message); return false; }
   toast('配置已保存');
+  return true;
 }
 
 async function testNotify() {
-  await saveSettings();
-  const res = await send('POST', `/api/test-notify`);
+  if (!(await saveSettings())) return;
   const el = document.getElementById('test-result');
+  el.textContent = '发送中…';
+  let res;
+  try {
+    const channel = document.getElementById('set-channel').value;
+    res = await send('POST', `/api/test-notify/${encodeURIComponent(channel)}`);
+  } catch (e) { el.textContent = '❌ 发送失败: ' + e.message; return; }
   if (!res) { el.textContent = '❌ 发送失败'; return; }
-  if (res.ok) { el.textContent = `✅ 发送成功(通道:${res.channel})`; }
-  else { el.textContent = `❌ 发送失败:${res.msg || ''}`; }
+  if (res.ok) el.textContent = `✅ 发送成功(通道:${res.channel})`;
+  else el.textContent = `❌ 发送失败:${res.msg || ''}`;
 }
 
 // 兼容旧函数名
 async function testDingTalk() { return testNotify(); }
 
+// ---------- 初始化 ----------
 loadDashboard();
 loadSources();
 loadSettings();
+// 若上次采集仍在后台运行(如定时任务),页面打开后继续显示进度
+(async () => {
+  try {
+    const d = await get('/api/collect/status');
+    if (d && d.running) startCollectPolling();
+  } catch (e) { /* 忽略 */ }
+})();
 </script>
 </body>
 </html>

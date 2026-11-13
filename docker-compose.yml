@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   vulnwatch:
     build: .
@@ -8,8 +6,21 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      # SQLite 数据库与运行数据持久化到宿主机
       - ./data:/app/data
     environment:
       - TZ=Asia/Shanghai
+      - VULNWATCH_TIMEZONE=Asia/Shanghai
       - VULNWATCH_DAILY_HOUR=9
       - VULNWATCH_DAILY_MINUTE=0
+      # 访问口令:留空=允许匿名访问(内网部署也建议设置,见 .env 文件)
+      - VULNWATCH_AUTH_TOKEN=${VULNWATCH_AUTH_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    # 单进程应用:不要扩容副本,也不要加 --workers
+    deploy:
+      replicas: 1

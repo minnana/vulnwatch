@@ -1,11 +1,10 @@
-"""数据模型。"""
-from datetime import datetime
-
+"""ORM 模型:监控源、漏洞、配置、推送记录。"""
 from sqlalchemy import (
     Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 
+from . import config
 from .database import Base
 
 
@@ -21,7 +20,7 @@ class MonitorSource(Base):
     cpe = Column(String(500), nullable=True)              # nvd_cpe 类型的 CPE 匹配串
     keyword = Column(String(500), nullable=True)          # rss 类型的标题过滤关键词(逗号分隔)
     enabled = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=config.utcnow)
 
     vulnerabilities = relationship("Vulnerability", back_populates="source", cascade="all, delete-orphan")
 
@@ -44,7 +43,7 @@ class Vulnerability(Base):
     tags = Column(Text, nullable=True)                        # 标签,逗号分隔(如 预警、POC公开、奇安信CERT验证)
     url = Column(Text, nullable=True)
     published_at = Column(DateTime, index=True, nullable=True)
-    first_seen_at = Column(DateTime, default=datetime.utcnow)
+    first_seen_at = Column(DateTime, default=config.utcnow)
     is_kev = Column(Boolean, default=False)                   # 是否在野利用(CISA KEV)
     ai_summary = Column(Text, nullable=True)                  # DeepSeek 生成的中文摘要(可选)
     source_id = Column(Integer, ForeignKey("monitor_sources.id"), nullable=False)
@@ -65,8 +64,8 @@ class AlertLog(Base):
     __tablename__ = "alert_logs"
 
     id = Column(Integer, primary_key=True, index=True)
-    triggered_at = Column(DateTime, default=datetime.utcnow)
+    triggered_at = Column(DateTime, default=config.utcnow)
     severity = Column(String(20), nullable=True)
     count = Column(Integer, default=0)
-    status = Column(String(20), default="success")  # success / failed
+    status = Column(String(20), default="success")  # success / failed / skipped / silent / baseline
     detail = Column(Text, nullable=True)

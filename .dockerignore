@@ -1,0 +1,17 @@
+.git
+.gitignore
+.github
+__pycache__
+*.py[cod]
+.venv
+venv
+data
+*.db
+*.db-shm
+*.db-wal
+*.log
+.env
+tests
+docs
+*.md
+.pytest_cache

@@ -1,0 +1,4 @@
+# 仅用于本地验证/冒烟测试的额外依赖，生产部署不需要安装本文件。
+# 用法：pip install -r requirements.txt -r requirements-dev.txt
+-r requirements.txt
+httpx==0.27.2

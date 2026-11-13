@@ -1,10 +1,12 @@
 """通用 RSS / 厂商公告采集器。"""
+import hashlib
 import re
 from datetime import datetime, timedelta
 from typing import List
 
 import feedparser
 
+from .. import config
 from .base import BaseCollector
 
 
@@ -20,12 +22,13 @@ class RssCollector(BaseCollector):
             return []
         feed = feedparser.parse(resp.content)
         keywords = [k.strip().lower() for k in (self.source.keyword or "").split(",") if k.strip()]
-        cutoff = datetime.utcnow() - timedelta(days=self.DAYS)
+        cutoff = config.utcnow() - timedelta(days=self.DAYS)
 
         results = []
         for entry in feed.entries:
             title = entry.get("title", "")
             link = entry.get("link", "")
+            entry_id = entry.get("id") or entry.get("guid") or link or ""
             summary = entry.get("summary", "") or entry.get("description", "")
             # 关键词过滤(若配置了关键词,标题/摘要需包含其一)
             if keywords:
@@ -39,6 +42,10 @@ class RssCollector(BaseCollector):
                 continue
 
             results.append({
+                # 非 CVE 公告(如 MSRC 公告)没有 cve_id,必须给出稳定的 unique_key,
+                # 否则 Upsert 无法匹配,每轮采集都会重复插入新行。
+                "unique_key": entry_id or "rss-" + hashlib.sha1(
+                    (title + "|" + link).encode("utf-8")).hexdigest()[:16],
                 "cve_id": self._extract_cve(title + " " + summary),
                 "title": title,
                 "description": strip_html(summary)[:2000],

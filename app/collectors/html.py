@@ -2,6 +2,7 @@
 import re
 from datetime import datetime
 from typing import List
+from urllib.parse import urljoin
 
 from .base import BaseCollector
 
@@ -49,7 +50,9 @@ class HtmlCollector(BaseCollector):
             # 尝试提取发布日期(如 Synology 的 2026-11-1 格式)
             published_at = self._extract_date(plain)
 
-            link = f"{self.source.url}#{adv_id}"
+            # 提取链接:公告编号通常处在 <a href="..."> 标签内,
+            # 用编号前 500 字符内最后一个 href(相对地址用 urljoin 补全)。
+            link = self._guess_link(html, m.start())
 
             results.append({
                 "cve_id": adv_id if adv_id.startswith("CVE") else None,
@@ -63,6 +66,15 @@ class HtmlCollector(BaseCollector):
                 "is_kev": False,
             })
         return results
+
+    def _guess_link(self, html: str, pos: int) -> str:
+        """从公告编号所在位置的附近找最近的 <a href>,拼成绝对地址。"""
+        start = max(0, pos - 500)
+        chunk = html[start:pos]
+        hrefs = re.findall(r'href=["\']([^"\']+)["\']', chunk)
+        if hrefs:
+            return urljoin(getattr(self.source, "url", "") or "", hrefs[-1])
+        return (getattr(self.source, "url", "") or "")[:2000]
 
     @staticmethod
     def _extract_date(text: str):

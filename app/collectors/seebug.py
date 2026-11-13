@@ -79,7 +79,8 @@ class SeebugCollector(BaseCollector):
 
             results.append({
                 "cve_id": cve_id,
-                "unique_key": ssv_id or f"SSV-{cve_id}",
+                # 没有编号也没有 CVE 时退回链接,避免生成 SSV-None 把不同公告合并成一条
+                "unique_key": ssv_id or (f"SSV-{cve_id}" if cve_id else url) or title,
                 "title": title or ssv_id,
                 "description": None,
                 "severity": severity,

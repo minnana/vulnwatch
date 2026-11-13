@@ -41,6 +41,7 @@ class CisaKevCollector(BaseCollector):
             added_at = None
 
         return {
+            "unique_key": cve_id or None,
             "cve_id": cve_id,
             "title": title,
             "description": desc,
