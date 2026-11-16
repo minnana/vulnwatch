@@ -30,6 +30,12 @@ _bulk_state = {"rows": None, "expires": 0.0, "error_until": 0.0}
 _bulk_lock = threading.Lock()
 
 
+def invalidate_bulk_cache():
+    """A new collection round must fetch current data, even below cache TTL."""
+    with _bulk_lock:
+        _bulk_state["expires"] = 0.0
+
+
 class NvdCpeCollector(BaseCollector):
     """通过关键词或 CPE 检索相关 CVE。"""
 

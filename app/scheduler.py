@@ -129,6 +129,8 @@ def collect_all(on_result: Optional[Callable[[dict], None]] = None) -> List[dict
     if not sources:
         return []
 
+    from .collectors.nvd import invalidate_bulk_cache
+    invalidate_bulk_cache()
     workers = max(1, min(config.COLLECT_MAX_WORKERS, len(sources)))
     results: List[dict] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -252,7 +254,7 @@ def _dedup_by_cve(vulns: List) -> List:
     out = []
     for v in ordered:
         cve_id = (_field(v, "cve_id") or "").upper()
-        unique_key = _field(v, "unique_key")
+        unique_key = (_field(v, "source_id"), _field(v, "unique_key")) if _field(v, "unique_key") else None
         if cve_id:
             if cve_id in seen_cve:
                 continue
@@ -294,184 +296,266 @@ def _filter_to_push(db, new_vulns: List, threshold: str) -> List:
     return _dedup_by_cve(result)
 
 
-# ---------- 每日任务 ----------
+# ---------- 推送：即时、每日、手动共用回执与互斥锁 ----------
 
-def _fill_ai_summaries(db, vulns: List) -> None:
-    """给推送列表里的前 N 条补中文摘要(仅在配置了 DeepSeek Key 时)。"""
-    api_key = crud.get_setting(db, "deepseek_api_key", "") or ""
-    if not api_key or not vulns:
-        return
-    from .summarize import summarize_vuln
-
-    mapping = {}
-    for v in vulns[: max(0, config.AI_SUMMARY_LIMIT)]:
-        if _field(v, "ai_summary"):
-            continue
-        vid = _field(v, "id")
-        if not vid:
-            continue
-        summary = summarize_vuln(api_key, v)
-        if summary:
-            if isinstance(v, dict):
-                v["ai_summary"] = summary
-            else:
-                v.ai_summary = summary
-            mapping[vid] = summary
-    if mapping:
-        try:
-            crud.update_ai_summaries(db, mapping)
-        except Exception:
-            logger.exception("写回 AI 摘要失败")
+_notification_lock = threading.Lock()
+_last_send_at = 0.0
+_retry_after = 0.0
 
 
-def _log_alert(db, severity: str, count: int, status: str, detail: str) -> None:
+def begin_notification() -> bool:
+    return _notification_lock.acquire(blocking=False)
+
+
+def end_notification() -> None:
+    _notification_lock.release()
+
+
+def is_notifying() -> bool:
+    return _notification_lock.locked()
+
+
+def setting_bool(db, key, default=False):
+    return str(crud.get_setting(db, key, str(default))).lower() == "true"
+
+
+def _log_alert(db, severity, count, status, detail):
+    db.add(models.AlertLog(severity=severity, count=count, status=status, detail=detail))
+    db.commit()
+
+
+def notification_selection(db, mode="pending", ids=None):
+    if mode == "selected":
+        rows = db.query(models.Vulnerability).filter(models.Vulnerability.id.in_(ids or [])).all()
+        if len(rows) != len(set(ids or [])):
+            raise ValueError("部分所选漏洞已不存在，请刷新列表")
+        return _dedup_by_cve(rows), "MANUAL"
+    threshold = (crud.get_setting(db, "instant_threshold" if mode == "instant" else "alert_threshold", "HIGH") or "HIGH").upper()
+    return _filter_to_push(db, crud.pending_notifications(db), threshold), threshold
+
+
+def channel_config(db):
+    channel = crud.get_setting(db, "notify_channel", "dingtalk") or "dingtalk"
+    if channel not in CHANNEL_KEYS:
+        raise ValueError("通知通道无效，请检查配置")
+    cred_key, secret_key = CHANNEL_KEYS[channel]
+    return (channel, crud.get_setting(db, cred_key, "") or "",
+            (crud.get_setting(db, secret_key, "") or "") if secret_key else "")
+
+
+def notification_preview(db, mode="pending", ids=None):
+    rows, threshold = notification_selection(db, mode, ids)
+    channel, credential, _ = channel_config(db)
+    batches = build_report_batches(rows, threshold, report_title="手动指定漏洞推送" if mode == "selected" else "手动漏洞情报推送")
+    return {"mode": mode, "channel": channel, "configured": bool(credential),
+            "count": len(rows), "parts": len(batches),
+            "messages": [text for text, _ in batches],
+            "items": [{"id": v.id, "cve": v.cve_id or v.unique_key,
+                       "title": v.title, "severity": v.severity, "is_kev": v.is_kev} for v in rows],
+            "note": "所选记录允许重复发送，忽略自动推送阈值和静默时段。" if mode == "selected"
+                    else "发送符合过滤条件的待推送内容；已成功发送和首次历史基线不重复发送。手动操作不受静默时段限制。"}
+
+
+def deliver_notifications(db, mode="instant", ids=None):
+    """Caller owns the notification lock. AI calls never block this path."""
+    if mode == "instant" and not setting_bool(db, "instant_enabled", True):
+        return {"status": "disabled", "sent": 0, "count": 0}
+    rows, threshold = notification_selection(db, mode, ids)
+    label = {"instant": "即时告警", "daily": "每日汇总",
+             "pending": "手动推送", "selected": "手动指定推送"}[mode]
+    original_count = len(rows)
+    if mode in ("instant", "daily") and _is_silent_time(db):
+        # Severe / actively exploited alerts may bypass quiet hours by explicit policy.
+        rows = [v for v in rows if setting_bool(db, "urgent_bypass_silent", True)
+                and (v.is_kev or v.severity == "CRITICAL")]
+    if not rows:
+        status = "silent" if original_count else "skipped"
+        if mode != "instant":
+            _log_alert(db, threshold, 0, status, f"{label}: 待推送 {original_count} 条，当前无可发送内容")
+        return {"status": status, "sent": 0, "count": original_count}
+    channel, credential, secret = channel_config(db)
+    if not credential:
+        _log_alert(db, threshold, 0, "failed", f"{label}: 未配置 {channel} 凭证，保留待推送内容")
+        return {"status": "failed", "sent": 0, "count": len(rows), "detail": "未配置通知凭证"}
+    titles = {"instant": "🚨 漏洞即时告警", "daily": "每日漏洞情报汇总",
+              "pending": "手动漏洞情报推送", "selected": "手动指定漏洞推送"}
+    batches = build_report_batches(rows, threshold, report_title=titles[mode])
+    sent_count = 0
+    status = "success"
+    for message, batch in batches:
+        if not _rate_limited_send(channel, credential, secret, titles[mode], message):
+            status = "failed"
+            break
+        crud.acknowledge_notifications(db, batch)
+        sent_count += len(batch)
+    detail = f"{label}: 已发送 {sent_count}/{len(rows)} 条，共 {len(batches)} 段，通道 {channel}"
+    if status == "failed":
+        detail += "；失败内容未确认，可重试"
+    _log_alert(db, threshold, sent_count, status, detail)
+    return {"status": status, "sent": sent_count, "count": len(rows), "parts": len(batches), "detail": detail}
+
+
+def _rate_limited_send(channel, credential, secret, title, message):
+    # The notification lock serializes callers; pace across sources and batches.
+    global _last_send_at
+    from time import sleep
+    delay = 3.1 - (monotonic() - _last_send_at)
+    if delay > 0:
+        sleep(delay)
     try:
-        db.add(models.AlertLog(severity=severity, count=count, status=status, detail=detail))
-        db.commit()
-    except Exception:
-        logger.exception("写推送日志失败")
-        try:
-            db.rollback()
-        except Exception:
-            pass
-
-
-def run_daily_job():
-    """每日汇总任务:采集 → 过滤 → 推送 → 记录日志。
-
-    读取持久化待推送记录；每个源首次成功采集只建立基线。
-    手动采集、静默延期和发送失败的数据会在后续任务继续处理。
-    """
-    from .database import SessionLocal
-
-    if not begin_collection(blocking=False):
-        logger.warning("每日任务跳过:已有采集任务在运行")
-        return
-    db = SessionLocal()
-    try:
-        total_new = 0
-        to_push: List = []
-        threshold = (crud.get_setting(db, "alert_threshold", "HIGH") or "HIGH").upper()
-
-        results = collect_all()
-        total_new = sum(r["new_count"] for r in results)
-        # Read durable pending records, including manual collections and failed
-        # deliveries from earlier days. Each source has its own initial baseline.
-        db.expire_all()
-        to_push = _filter_to_push(db, crud.pending_notifications(db), threshold)
-        baseline_count = sum(bool(r.get("baseline")) for r in results)
-        failures = sum(bool(r.get("error")) for r in results)
-        detail = f"新增 {total_new} 条,待推送 {len(to_push)} 条,基线源 {baseline_count},失败源 {failures}"
-
-        # 静默时段:静默窗口内只入库不推送
-        if _is_silent_time(db):
-            _log_alert(db, threshold, 0, "silent", detail + ",静默时段不推送")
-            logger.info("每日任务:静默时段,跳过推送(%s 新增)", total_new)
-            return
-
-        # 通道路由:读 notify_channel,默认钉钉;未知通道回退钉钉
-        channel = (crud.get_setting(db, "notify_channel", "dingtalk") or "dingtalk").strip().lower()
-        if channel not in CHANNEL_KEYS:
-            logger.warning("未知通知通道 %s,回退 dingtalk", channel)
-            channel = "dingtalk"
-        cred_key, secret_key = CHANNEL_KEYS[channel]
-        credential = crud.get_setting(db, cred_key, "") or ""
-        secret = (crud.get_setting(db, secret_key, "") or "") if secret_key else ""
-
-        if not to_push or not credential:
-            status = "failed" if failures else ("baseline" if baseline_count else "skipped")
-            _log_alert(db, threshold, 0, status, detail + ",无需要推送内容或未配置凭证")
-            logger.info("每日任务:跳过推送(%s)", detail)
-            return
-
-        # AI 摘要(可选增强,失败不影响主链路)
-        _fill_ai_summaries(db, to_push)
-
-        batches = build_report_batches(to_push, threshold)
-        ok = True
-        sent_count = 0
-        for idx, (text, batch_items) in enumerate(batches, 1):
-            if send(channel, credential, secret, "漏洞情报汇总", text):
-                crud.acknowledge_notifications(db, batch_items)
-                sent_count += len(batch_items)
-            else:
-                ok = False
-                logger.warning("第 %d/%d 段报告发送失败,保留待推送记录", idx, len(batches))
-                break
-            if idx < len(batches):
-                # DingTalk robots rate-limit bursts; keep below 20 messages/minute.
-                from time import sleep
-                sleep(3.1)
-        status = "success" if ok else "failed"
-        detail += f",已发送 {sent_count} 条/{len(batches)} 段(通道:{channel})"
-        _log_alert(db, threshold, sent_count, status, detail)
-        logger.info("每日任务完成: 新增 %s, 过滤后 %s, 推送 %s 条 [%s]",
-                    total_new, len(to_push), sent_count, status)
-    except Exception as e:
-        logger.exception("每日任务异常")
-        _log_alert(db, "UNKNOWN", 0, "failed", f"任务异常: {e}")
+        return send(channel, credential, secret, title, message)
     finally:
-        db.close()
+        _last_send_at = monotonic()
+
+
+def dispatch_notifications(mode="instant"):
+    global _retry_after
+    from .database import SessionLocal
+    if not begin_notification():
+        return {"status": "busy", "sent": 0}
+    try:
+        if mode == "instant" and monotonic() < _retry_after:
+            return {"status": "retry_wait", "sent": 0}
+        with SessionLocal() as db:
+            result = deliver_notifications(db, mode)
+            if result["status"] == "failed":
+                _retry_after = monotonic() + 45
+            return result
+    except Exception:
+        _retry_after = monotonic() + 45
+        logger.exception("通知任务异常(%s)", mode)
+        return {"status": "failed", "sent": 0, "detail": "通知任务异常，请查看服务日志"}
+    finally:
+        end_notification()
+
+
+def collect_with_alerts(on_result=None):
+    def completed(result):
+        if on_result:
+            on_result(result)
+        # Each completed source can alert immediately; do not wait for slow sources.
+        if not result.get("error"):
+            dispatch_notifications("instant")
+    results = collect_all(on_result=completed)
+    dispatch_notifications("instant")
+    return results
+
+
+def run_poll_job():
+    if not begin_collection():
+        return
+    try:
+        results = collect_with_alerts()
+        failures = sum(bool(r.get("error")) for r in results)
+        logger.info("定期采集完成: %d 个源，%d 个失败", len(results), failures)
+        if failures:
+            from .database import SessionLocal
+            with SessionLocal() as db:
+                _log_alert(db, "UNKNOWN", 0, "failed", f"定期采集: {failures}/{len(results)} 个源失败，请查看监控源状态")
+    finally:
         end_collection()
 
 
-# ---------- 定时器 ----------
+def run_daily_job():
+    # Collection has its own interval job. Daily summaries only flush pending data.
+    return dispatch_notifications("daily")
 
-def _configured_daily_time(db=None) -> Tuple[int, int]:
-    """优先读 Web 配置 daily_time(HH:MM),否则用环境变量默认值。"""
-    hour, minute = config.DAILY_HOUR, config.DAILY_MINUTE
-    own = False
-    if db is None:
-        from .database import SessionLocal
-        db = SessionLocal()
-        own = True
+
+# ---------- 调度与页面状态 ----------
+
+POLL_JOB_ID = "poll_vuln_job"
+RETRY_JOB_ID = "retry_notifications"
+AI_JOB_ID = "ai_summaries"
+
+
+def _configured_daily_time(db=None):
+    from .database import SessionLocal
+    own = db is None
+    db = db or SessionLocal()
     try:
-        parsed = parse_hhmm(crud.get_setting(db, "daily_time", ""))
-        if parsed:
-            hour, minute = parsed
+        return parse_hhmm(crud.get_setting(db, "daily_time", "")) or (config.DAILY_HOUR, config.DAILY_MINUTE)
     finally:
         if own:
             db.close()
-    return hour, minute
 
 
-def _daily_trigger(hour: int, minute: int) -> CronTrigger:
+def _daily_trigger(hour, minute):
     return CronTrigger(hour=hour, minute=minute, timezone=config.TZ)
 
 
+def reschedule_daily_job(db=None):
+    from .database import SessionLocal
+    own = db is None
+    db = db or SessionLocal()
+    try:
+        hour, minute = _configured_daily_time(db)
+        if scheduler.running:
+            if setting_bool(db, "daily_enabled", True):
+                current = scheduler.get_job(DAILY_JOB_ID)
+                if current and str(current.trigger) == str(_daily_trigger(hour, minute)):
+                    return hour, minute
+                scheduler.add_job(run_daily_job, _daily_trigger(hour, minute), id=DAILY_JOB_ID,
+                                  replace_existing=True, max_instances=1, coalesce=True, misfire_grace_time=3600)
+            elif scheduler.get_job(DAILY_JOB_ID):
+                scheduler.remove_job(DAILY_JOB_ID)
+        return hour, minute
+    finally:
+        if own:
+            db.close()
+
+
+def reschedule_jobs(db):
+    reschedule_daily_job(db)
+    if scheduler.running:
+        minutes = int(crud.get_setting(db, "collect_interval_minutes", "10"))
+        current = scheduler.get_job(POLL_JOB_ID)
+        if current and current.trigger.interval.total_seconds() == minutes * 60:
+            return
+        scheduler.add_job(run_poll_job, "interval", minutes=minutes, id=POLL_JOB_ID,
+                          replace_existing=True, max_instances=1, coalesce=True, misfire_grace_time=120)
+
+
 def start_scheduler(db=None):
-    """启动定时任务(服务启动时调用一次)。"""
     if scheduler.running:
         return
-    hour, minute = _configured_daily_time(db)
-    scheduler.add_job(
-        run_daily_job,
-        _daily_trigger(hour, minute),
-        id=DAILY_JOB_ID,
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=3600,
-    )
-    scheduler.start()
-    logger.info("定时任务已启动: 每日 %02d:%02d (%s)", hour, minute, config.TIMEZONE_NAME)
+    from .database import SessionLocal
+    from .ai_worker import run_ai_job
+    own = db is None
+    db = db or SessionLocal()
+    try:
+        scheduler.start()
+        reschedule_jobs(db)
+        scheduler.add_job(dispatch_notifications, "interval", seconds=60, id=RETRY_JOB_ID,
+                          max_instances=1, coalesce=True, misfire_grace_time=60)
+        scheduler.add_job(run_ai_job, "interval", seconds=60, id=AI_JOB_ID,
+                          max_instances=1, coalesce=True, misfire_grace_time=60)
+        logger.info("调度已启动: 每 %s 分钟采集，独立即时告警/每日汇总/AI 摘要", crud.get_setting(db, "collect_interval_minutes", "10"))
+    finally:
+        if own:
+            db.close()
 
 
-def reschedule_daily_job(db=None) -> Tuple[int, int]:
-    """Web 修改 daily_time 后立即生效。返回新的 (hour, minute)。"""
-    hour, minute = _configured_daily_time(db)
-    if scheduler.running and scheduler.get_job(DAILY_JOB_ID):
-        scheduler.reschedule_job(DAILY_JOB_ID, trigger=_daily_trigger(hour, minute))
-        logger.info("定时任务已重排: 每日 %02d:%02d", hour, minute)
-    return hour, minute
+def runtime_status(db):
+    from .ai_worker import ai_status
+    pending, _ = notification_selection(db)
+    urgent, _ = notification_selection(db, "instant")
+    jobs = {job.id: job.next_run_time.isoformat() if job.next_run_time else None for job in scheduler.get_jobs()}
+    latest = db.query(models.SourceCollectionState.last_attempt_at).order_by(models.SourceCollectionState.last_attempt_at.desc()).first()
+    return {"timezone": config.TIMEZONE_NAME, "collecting": is_collecting(), "notifying": is_notifying(),
+            "collect_interval_minutes": int(crud.get_setting(db, "collect_interval_minutes", "10")),
+            "instant_enabled": setting_bool(db, "instant_enabled", True),
+            "instant_threshold": crud.get_setting(db, "instant_threshold", "HIGH"),
+            "daily_enabled": setting_bool(db, "daily_enabled", True),
+            "daily_time": crud.get_setting(db, "daily_time", "09:00"),
+            "next_collect_at": jobs.get(POLL_JOB_ID), "next_daily_at": jobs.get(DAILY_JOB_ID),
+            "last_collect_at": latest[0] if latest else None, "pending": len(pending), "urgent_pending": len(urgent),
+            "ai": ai_status(db)}
 
 
 def stop_scheduler():
     if scheduler.running:
         scheduler.shutdown(wait=False)
-        logger.info("定时任务已停止")
 
 
-def collect_elapsed(started_at: float) -> float:
-    """辅助:返回本次采集已耗时(秒),供状态接口展示。"""
+def collect_elapsed(started_at):
     return round(monotonic() - started_at, 1)

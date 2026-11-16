@@ -203,7 +203,7 @@ def _chunk_text(text: str, max_bytes: int) -> List[str]:
     return parts
 
 
-def build_report_batches(vulns, threshold_severity="HIGH", max_items=None):
+def build_report_batches(vulns, threshold_severity="HIGH", max_items=None, report_title="每日漏洞情报汇总"):
     """Keep each record in one message so successful chunks can be acknowledged."""
     items = sorted(list(vulns or []), key=lambda v: (
         0 if _field(v, "is_kev") else 1,
@@ -234,7 +234,7 @@ def build_report_batches(vulns, threshold_severity="HIGH", max_items=None):
     now = config.now_local().strftime("%Y-%m-%d %H:%M")
     result = []
     for idx, (blocks, records) in enumerate(groups, 1):
-        header = (f"## 🔒 每日漏洞情报汇总 (第 {idx}/{len(groups)} 部分)" + chr(10)
+        header = (f"## 🔒 {report_title} (第 {idx}/{len(groups)} 部分)" + chr(10)
                   + f"共 {len(items)} 条需要关注 (阈值 {threshold_severity.upper()}) · {now}")
         result.append((header + chr(10)*2 + (chr(10)*2).join(blocks), records))
     return result

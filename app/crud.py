@@ -206,9 +206,14 @@ def acknowledge_notifications(db: Session, vulns, status="sent") -> None:
         if key.endswith(":kev"):
             keys.add(key[:-4] + ":normal")
     for key in keys:
-        db.execute(sqlite_insert(models.NotificationReceipt).values(
-            event_key=key, status=status, recorded_at=config.utcnow()
-        ).on_conflict_do_nothing(index_elements=["event_key"]))
+        stmt = sqlite_insert(models.NotificationReceipt).values(
+            event_key=key, status=status, recorded_at=config.utcnow())
+        if status == "sent":
+            stmt = stmt.on_conflict_do_update(index_elements=["event_key"],
+                set_={"status": "sent", "recorded_at": config.utcnow()})
+        else:
+            stmt = stmt.on_conflict_do_nothing(index_elements=["event_key"])
+        db.execute(stmt)
     db.commit()
 
 

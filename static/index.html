@@ -93,7 +93,15 @@
   .page.active { display: block; }
   .link { color: var(--primary); text-decoration: none; }
   .empty { text-align: center; color: var(--muted); padding: 40px 0; }
-  .collect-line { padding: 2px 0; }
+  .collect-line { padding: 5px 0; border-bottom: 1px solid var(--border); }
+  dialog { margin: auto; width: min(700px, calc(100% - 32px)); max-height: calc(100vh - 48px); overflow: auto; border: 1px solid var(--border); border-radius: 12px; padding: 24px; box-shadow: 0 16px 60px #0004; }
+  dialog::backdrop { background: #11182788; }
+  .dialog-actions { position: sticky; bottom: -24px; background: white; padding: 16px 0 8px; margin: 12px 0 0; }
+  .message-preview { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 13px; padding: 12px; background: var(--bg); border-radius: 6px; margin: 12px 0; }
+  td.actions { white-space: nowrap; }
+  td { overflow-wrap: anywhere; }
+  .hint + .hint { margin-top: 8px; }
+  @media(max-width: 800px) { .sidebar { width: 150px; } .main { padding: 16px; overflow-x: auto; } .grid-2 { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -119,11 +127,17 @@
         </div>
       </div>
       <div class="card">
+        <h2>监测与告警策略 <span class="badge low">v0.3.0</span></h2>
+        <div id="runtime-status" class="hint">加载运行状态…</div>
+      </div>
+      <div class="card">
         <div class="toolbar">
-          <button class="btn" id="collect-btn" onclick="doCollectAll()">🔄 立即采集</button>
-          <span class="hint">手动触发一次全量采集(后台运行,可离开本页)</span>
+          <button class="btn" id="collect-btn" onclick="doCollectAll()">🔄 立即检测并告警</button>
+          <button class="btn secondary" id="push-btn" onclick="previewPush('pending')">📤 手动推送</button>
         </div>
+        <p class="hint">立即检测会采集所有启用的源，并按即时告警规则发送新增内容。手动推送先预览待发送内容；历史记录可在漏洞列表中单独推送。</p>
         <div id="collect-result" class="hint"></div>
+        <div id="push-result" class="hint" aria-live="polite"></div>
       </div>
       <div class="card">
         <h2>最近推送记录</h2>
@@ -177,12 +191,12 @@
           <tbody id="source-tbody"></tbody>
         </table>
       </div>
-      <div class="card" id="source-form" style="display:none">
+      <dialog id="source-form" aria-labelledby="source-form-title">
         <h2 id="source-form-title">新增监控源</h2>
         <input type="hidden" id="s-id">
-        <div class="form-row"><label>名称</label><input id="s-name" style="width:100%"></div>
+        <div class="form-row"><label for="s-name">名称</label><input id="s-name" style="width:100%"></div>
         <div class="grid-2">
-          <div class="form-row"><label>类别</label>
+          <div class="form-row"><label for="s-category">类别</label>
             <select id="s-category" style="width:100%">
               <option value="OS">操作系统</option><option value="NAS">NAS</option>
               <option value="Virtualization">虚拟化</option><option value="WebServer">Web服务器</option>
@@ -190,7 +204,7 @@
               <option value="Intelligence">情报</option><option value="Other">其他</option>
             </select>
           </div>
-          <div class="form-row"><label>采集类型</label>
+          <div class="form-row"><label for="s-type">采集类型</label>
             <select id="s-type" style="width:100%" onchange="onTypeChange()">
               <option value="nvd_cpe">NVD 关键词/CPE 检索</option>
               <option value="rss">RSS / Atom</option>
@@ -208,15 +222,15 @@
             </select>
           </div>
         </div>
-        <div class="form-row"><label>URL</label><input id="s-url" style="width:100%" placeholder="API / RSS 地址"></div>
+        <div class="form-row"><label for="s-url">URL</label><input id="s-url" style="width:100%" placeholder="API / RSS 地址"></div>
         <div class="form-row" id="s-cpe-row"><label>CPE 匹配串(可选)</label><input id="s-cpe" style="width:100%" placeholder="留空则用下方关键词搜索;精确版本示例 cpe:2.3:o:vmware:esxi:7.0:*:*:*:*:*:*:*"></div>
         <div class="form-row" id="s-kw-row" style="display:none"><label>关键词(逗号分隔,可选)</label><input id="s-kw" style="width:100%" placeholder="NVD 检索关键词 或 RSS 标题过滤关键词"></div>
         <div class="form-row"><label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="s-enabled" checked>启用</label></div>
-        <div class="toolbar">
-          <button class="btn" onclick="saveSource()">保存</button>
+        <div class="toolbar dialog-actions">
+          <button class="btn" id="source-save" onclick="saveSource()">保存</button>
           <button class="btn secondary" onclick="hideSourceForm()">取消</button>
         </div>
-      </div>
+      </dialog>
     </div>
 
     <!-- 配置 -->
@@ -248,14 +262,14 @@
       <div class="card">
         <h2>🎯 推送过滤</h2>
         <div class="form-row">
-          <label>推送阈值</label>
+          <label>每日 / 手动待推送阈值</label>
           <select id="set-threshold">
             <option value="CRITICAL">仅严重</option>
             <option value="HIGH" selected>高危及以上</option>
             <option value="MEDIUM">中危及以上</option>
-            <option value="LOW">全部</option>
+            <option value="LOW">低危及以上</option><option value="UNKNOWN">全部（含未知）</option>
           </select>
-          <div class="hint">达到该等级及以上的漏洞才推送;在野利用(KEV)始终推送</div>
+          <div class="hint">影响每日汇总和手动待推送；即时告警等级在下方单独设置。KEV 绕过等级阈值，但仍受产品关键词与标签筛选。</div>
         </div>
         <div class="form-row">
           <label>产品关键词白名单(逗号分隔,留空=全部)</label>
@@ -275,24 +289,43 @@
       </div>
       <div class="card">
         <h2>🌙 静默时段</h2>
+        <div class="form-row"><label><input type="checkbox" id="set-urgent-bypass" checked> 严重和 KEV 告警突破静默时段</label></div>
         <div class="form-row">
-          <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="set-silent-enabled">启用静默时段(不推送)</label>
+          <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="set-silent-enabled">启用静默时段</label>
         </div>
         <div class="grid-2">
           <div class="form-row"><label>开始时间(HH:MM)</label><input id="set-silent-start" placeholder="00:00"></div>
           <div class="form-row"><label>结束时间(HH:MM)</label><input id="set-silent-end" placeholder="07:00"></div>
         </div>
-        <div class="hint">静默窗口内漏洞照常入库,只是不推送,避免夜间打扰</div>
+        <div class="hint">普通告警在静默时段保留待推送；符合即时阈值的内容在静默结束后按分钟重试，其他内容等每日汇总。手动推送不受静默限制。</div>
       </div>
       <div class="card">
-        <h2>🤖 DeepSeek(可选增强)</h2>
-        <div class="form-row"><label>API Key</label><input type="password" autocomplete="off" id="set-ds-key" style="width:100%" placeholder="sk-..."></div>
-        <div class="hint">填入后,每日推送里排名靠前的漏洞会自动生成中文摘要;留空则跳过,不影响主链路</div>
+        <h2>🤖 DeepSeek 公告解读</h2>
+        <div class="form-row"><label><input type="checkbox" id="set-ai-enabled"> 启用后台中文解读</label></div>
+        <div class="form-row"><label for="set-ds-key">API Key</label><input type="password" autocomplete="off" id="set-ds-key" style="width:100%" placeholder="sk-..."></div>
+        <div class="grid-2">
+          <div class="form-row"><label for="set-ai-model">模型</label><input id="set-ai-model" value="deepseek-flash" style="width:100%"></div>
+          <div class="form-row"><label for="set-ai-limit">每天最多调用次数</label><input type="number" id="set-ai-limit" min="0" max="100" value="20"></div>
+        </div>
+        <div class="form-row"><label for="set-ai-batch">每轮最多解读条数</label><input type="number" id="set-ai-batch" min="1" max="20" value="5"></div>
+        <p class="hint">作用：把公开公告整理为中文「风险、受影响范围、建议操作」。不扫描你的设备、不判断公司是否中招，也不负责决定告警等级。</p>
+        <p class="hint">流程：先发原始告警 → 后台每分钟处理已推送且没有摘要的记录 → 缓存到漏洞列表；后续手动推送可附带已有摘要。首次历史基线不批量调用 AI，不为摘要再补发一轮通知。</p>
+        <p class="hint">仅发送该条公告资料到 DeepSeek；未配置 Key、关闭开关或调用失败，采集和通知仍照常运行。调用按你的 DeepSeek 账号计费；次数上限不是金额上限。失败至少间隔一小时再试，已有摘要复用。</p>
+        <div id="ai-status" class="hint"></div>
       </div>
       <div class="card">
-        <h2>⏰ 定时任务</h2>
-        <div class="form-row"><label>每日汇总时间(HH:MM)</label><input id="set-time" placeholder="09:00"></div>
-        <div class="hint">保存后立即生效(无需重启);时区由 VULNWATCH_TIMEZONE 控制,默认 Asia/Shanghai</div>
+        <h2>⏱️ 定期检测与即时告警</h2>
+        <div class="form-row"><label for="set-interval">采集间隔（分钟，5–1440）</label><input type="number" id="set-interval" min="5" max="1440" value="10"></div>
+        <div class="form-row"><label><input type="checkbox" id="set-instant" checked> 采集到符合条件的新漏洞后立即推送</label></div>
+        <div class="form-row"><label for="set-instant-threshold">即时推送等级</label><select id="set-instant-threshold"><option value="HIGH">高危、严重及 KEV</option><option value="CRITICAL">严重及 KEV</option></select></div>
+        <p class="hint">每个源采集完成即可触发告警，不必等其他源结束。失败内容每分钟重试；已成功发送的不在每日汇总中重复发送。时效受采集间隔、请求耗时与情报源更新速度影响。</p>
+      </div>
+      <div class="card">
+        <h2>⏰ 每日汇总</h2>
+        <div class="form-row"><label><input type="checkbox" id="set-daily-enabled" checked> 启用每日汇总</label></div>
+        <div class="form-row"><label for="set-time">每日汇总时间（HH:MM）</label><input type="time" id="set-time" value="09:00"></div>
+        <p class="hint">只处理符合「每日/手动推送阈值」的剩余待推送记录；没有内容时不发空日报。开启即时告警后，09:00 不是紧急漏洞的等待时间。</p>
+        <p class="hint">所有配置保存后立即生效。业务时区显示在概览页，默认 Asia/Shanghai。</p>
       </div>
       <div class="toolbar">
         <button class="btn" onclick="saveSettings()">保存全部配置</button>
@@ -300,7 +333,17 @@
     </div>
   </div>
 </div>
-<div class="toast" id="toast"></div>
+<dialog id="push-dialog" aria-labelledby="push-title">
+  <h2 id="push-title">手动推送预览</h2>
+  <p id="push-summary"></p>
+  <p id="push-note" class="hint"></p>
+  <div id="push-preview"></div>
+  <div class="toolbar dialog-actions">
+    <button class="btn" id="push-confirm" onclick="confirmPush()">确认发送</button>
+    <button class="btn secondary" onclick="document.getElementById('push-dialog').close()">取消</button>
+  </div>
+</dialog>
+<div class="toast" id="toast" role="status"></div>
 
 <script>
 const API = '';
@@ -330,6 +373,7 @@ function authHeaders() {
 
 function toast(msg) {
   const t = document.getElementById('toast');
+  (document.querySelector('dialog[open]') || document.body).appendChild(t);
   t.textContent = msg; t.classList.add('show');
   setTimeout(() => t.classList.remove('show'), 2500);
 }
@@ -413,6 +457,7 @@ function safeLink(url) {
 // ---------- 概览 ----------
 async function loadDashboard() {
   try {
+    await loadRuntime();
     const d = await get('/api/stats?days=7');
     document.getElementById('stat-total').textContent = d.total;
     document.getElementById('stat-critical').textContent = d.critical;
@@ -421,8 +466,8 @@ async function loadDashboard() {
     const alerts = await get('/api/alerts?limit=10');
     const names = {success:'发送成功',failed:'失败',baseline:'建立基线',skipped:'无待推送内容',silent:'静默延期'};
     document.getElementById('alert-history').innerHTML = alerts.length ? alerts.map(a =>
-      `<div class="collect-line">${esc((a.triggered_at || '').replace('T',' ').slice(0,19))} UTC · ${esc(names[a.status] || a.status)} · ${esc(a.detail || '')}</div>`
-    ).join('') : '暂无推送记录；新数据将在每日汇总时处理。';
+      `<div class="collect-line">${esc(fmtTime(a.triggered_at))} · ${esc(names[a.status] || a.status)} · ${esc(a.detail || '')}</div>`
+    ).join('') : '暂无推送记录；新漏洞将按即时告警和每日汇总策略处理。';
   } catch (e) {
     toast('加载概览失败: ' + e.message);
   }
@@ -453,7 +498,7 @@ async function loadVulns() {
       <td>${esc(v.cvss_score ?? '-')}</td>
       <td style="color:var(--muted)">${esc(v.source_name || '')}</td>
       <td style="color:var(--muted);font-size:12px">${v.published_at ? esc(v.published_at.slice(0,10)) : '-'}</td>
-      <td>${safeLink(v.url)}</td>
+      <td>${safeLink(v.url)}<br><button class="btn small secondary" onclick="previewPush('selected',[${v.id}])">推送</button></td>
     </tr>`).join('');
 }
 
@@ -480,7 +525,8 @@ async function loadSources() {
 }
 
 function showSourceForm() {
-  document.getElementById('source-form').style.display = 'block';
+  const dialog = document.getElementById('source-form');
+  if (!dialog.open) dialog.showModal();
   document.getElementById('source-form-title').textContent = '新增监控源';
   document.getElementById('s-id').value = '';
   document.getElementById('s-name').value = '';
@@ -492,9 +538,10 @@ function showSourceForm() {
   document.getElementById('s-category').value = 'OS';
   document.getElementById('s-type').value = 'nvd_cpe';
   onTypeChange();
+  document.getElementById('s-name').focus({preventScroll: true});
 }
 
-function hideSourceForm() { document.getElementById('source-form').style.display = 'none'; }
+function hideSourceForm() { document.getElementById('source-form').close(); }
 
 function onTypeChange() {
   const t = document.getElementById('s-type').value;
@@ -504,9 +551,9 @@ function onTypeChange() {
 
 async function editSource(id) {
   let d;
-  try { d = await get('/api/sources'); } catch (e) { toast('加载失败: ' + e.message); return; }
-  const s = (d || []).find(x => x.id === id);
-  if (!s) return;
+  try { d = await get('/api/sources/' + id); } catch (e) { toast('加载失败: ' + e.message); return; }
+  const s = d;
+  if (!s) { toast('监控源已不存在，请刷新'); return; }
   showSourceForm();
   document.getElementById('source-form-title').textContent = '编辑监控源';
   document.getElementById('s-id').value = s.id;
@@ -536,7 +583,7 @@ async function saveSource() {
     if (id) await send('PUT', `/api/sources/${id}`, body);
     else await send('POST', '/api/sources', body);
   } catch (e) { toast('保存失败: ' + e.message); return; }
-  toast('已保存'); hideSourceForm(); loadSources();
+  toast('已保存'); hideSourceForm(); loadSources(); loadDashboard();
 }
 
 async function delSource(id) {
@@ -617,7 +664,7 @@ async function collectOne(id) {
   catch (e) { toast('采集失败: ' + e.message); return; }
   if (!d) { toast('采集失败'); return; }
   toast(`${d.source_name}: 获取 ${d.fetched} 条, 新增 ${d.new_count} 条${d.error ? ' 失败:' + d.error : ''}`);
-  loadDashboard();
+  loadSources(); loadDashboard();
 }
 
 // ---------- 配置 ----------
@@ -640,6 +687,16 @@ async function loadSettings() {
   document.getElementById('set-silent-end').value = d.silent_hours_end || '07:00';
   document.getElementById('set-ds-key').value = d.deepseek_api_key || '';
   document.getElementById('set-time').value = d.daily_time || '09:00';
+  document.getElementById('set-interval').value = d.collect_interval_minutes || '10';
+  document.getElementById('set-instant').checked = d.instant_enabled !== 'false';
+  document.getElementById('set-instant-threshold').value = d.instant_threshold || 'HIGH';
+  document.getElementById('set-urgent-bypass').checked = d.urgent_bypass_silent !== 'false';
+  document.getElementById('set-daily-enabled').checked = d.daily_enabled !== 'false';
+  document.getElementById('set-ai-enabled').checked = d.ai_enabled === 'true';
+  document.getElementById('set-ai-model').value = d.ai_model || 'deepseek-flash';
+  document.getElementById('set-ai-limit').value = d.ai_daily_limit || '20';
+  document.getElementById('set-ai-batch').value = d.ai_batch_limit || '5';
+  try { await loadRuntime(); } catch (e) { toast('运行状态加载失败：' + e.message); }
   onChannelChange();
 }
 
@@ -676,6 +733,15 @@ function collectSettings() {
     silent_hours_end: document.getElementById('set-silent-end').value,
     deepseek_api_key: document.getElementById('set-ds-key').value,
     daily_time: document.getElementById('set-time').value,
+    collect_interval_minutes: document.getElementById('set-interval').value,
+    instant_enabled: String(document.getElementById('set-instant').checked),
+    instant_threshold: document.getElementById('set-instant-threshold').value,
+    urgent_bypass_silent: String(document.getElementById('set-urgent-bypass').checked),
+    daily_enabled: String(document.getElementById('set-daily-enabled').checked),
+    ai_enabled: String(document.getElementById('set-ai-enabled').checked),
+    ai_model: document.getElementById('set-ai-model').value,
+    ai_daily_limit: document.getElementById('set-ai-limit').value,
+    ai_batch_limit: document.getElementById('set-ai-batch').value,
   };
 }
 
@@ -687,6 +753,7 @@ async function saveSettings() {
     await send('PUT', '/api/settings', { values });
   } catch (e) { toast('保存失败: ' + e.message); return false; }
   toast('配置已保存');
+  loadRuntime().catch(() => {});
   return true;
 }
 
@@ -707,10 +774,96 @@ async function testNotify() {
 // 兼容旧函数名
 async function testDingTalk() { return testNotify(); }
 
+// ---------- 运行策略、手动推送 ----------
+let runtimeTimezone = 'Asia/Shanghai';
+let pushRequest = null;
+let pushTimer = null;
+
+function fmtTime(value) {
+  if (!value) return '—';
+  const input = /(?:Z|[+-]\d{2}:\d{2})$/.test(value) ? value : value + 'Z';
+  const date = new Date(input);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', {timeZone: runtimeTimezone, hour12: false});
+}
+
+async function loadRuntime() {
+  const d = await get('/api/runtime');
+  runtimeTimezone = d.timezone || 'Asia/Shanghai';
+  document.getElementById('runtime-status').innerHTML =
+    `<div>每 <b>${d.collect_interval_minutes} 分钟</b>采集 · 即时告警 <b>${d.instant_enabled ? (d.instant_threshold === 'HIGH' ? '高危 / 严重 / KEV' : '严重 / KEV') : '已关闭'}</b> · 每日汇总 ${d.daily_enabled ? esc(d.daily_time) : '已关闭'}（${esc(runtimeTimezone)}）</div>
+     <div>下次采集：${esc(fmtTime(d.next_collect_at))} · 下次汇总：${esc(fmtTime(d.next_daily_at))}</div>
+     <div>最近采集：${esc(fmtTime(d.last_collect_at))} · 待推送：<b>${d.pending}</b> 条，其中即时告警 ${d.urgent_pending} 条 ${d.collecting ? ' · 正在采集…' : ''} ${d.notifying ? ' · 正在推送…' : ''}</div>`;
+  document.getElementById('ai-status').textContent =
+    `${d.ai.enabled ? '增强开关已启用' : '增强开关已关闭'} · ${d.ai.configured ? '已配置 Key' : '尚未配置 Key'} · 今日调用 ${d.ai.calls_today}/${d.ai.daily_limit} 次${d.ai.last_status ? ' · 最近结果：' + ({success:'成功',failed:'失败，稍后重试',running:'处理中'}[d.ai.last_status] || d.ai.last_status) : ''}`;
+}
+
+async function previewPush(mode, ids = []) {
+  const request = {mode, ids};
+  try {
+    const d = await send('POST', '/api/notifications/preview', request);
+    pushRequest = request;
+    document.getElementById('push-summary').textContent = `发送到 ${d.channel}：${d.count} 条漏洞，预计 ${d.parts} 条消息。`;
+    document.getElementById('push-note').textContent = d.note + (d.configured ? '' : ' 请先配置通知通道。');
+    const preview = document.getElementById('push-preview');
+    preview.replaceChildren();
+    for (const message of d.messages.slice(0, 3)) {
+      const el = document.createElement('pre');
+      el.className = 'message-preview';
+      el.textContent = message;
+      preview.appendChild(el);
+    }
+    if (!d.count) preview.textContent = '当前没有待推送告警。首次历史基线不会自动发送，可到漏洞列表点击某条记录的「推送」。';
+    if (d.parts > 3) {
+      const note = document.createElement('p');
+      note.textContent = '这里展示前 3 条消息，确认后将发送全部 ' + d.parts + ' 条。';
+      preview.appendChild(note);
+    }
+    document.getElementById('push-confirm').disabled = !d.count || !d.configured;
+    document.getElementById('push-dialog').showModal();
+  } catch (e) { toast('预览失败：' + e.message); }
+}
+
+async function confirmPush() {
+  if (!pushRequest) return;
+  const button = document.getElementById('push-confirm');
+  button.disabled = true;
+  try {
+    await send('POST', '/api/notifications/send', pushRequest);
+    document.getElementById('push-dialog').close();
+    document.getElementById('push-result').textContent = '推送任务已开始，可离开本页；结果会记录在推送日志。';
+    if (pushTimer) clearInterval(pushTimer);
+    pushTimer = setInterval(pollPushStatus, 1500);
+    pollPushStatus();
+  } catch (e) { button.disabled = false; toast('推送失败：' + e.message); }
+}
+
+async function pollPushStatus() {
+  try {
+    const d = await get('/api/notifications/status');
+    document.getElementById('push-btn').disabled = d.running;
+    if (d.running) return;
+    if (pushTimer) clearInterval(pushTimer);
+    pushTimer = null;
+    if (d.result) {
+      const msg = d.result.detail || ('已发送 ' + (d.result.sent || 0) + ' 条');
+      document.getElementById('push-result').textContent = msg;
+      toast(msg);
+      loadDashboard();
+    }
+  } catch (e) {
+    if (pushTimer) clearInterval(pushTimer);
+    pushTimer = null;
+    document.getElementById('push-btn').disabled = false;
+    toast('无法获取推送状态：' + e.message);
+  }
+}
+
+
 // ---------- 初始化 ----------
 loadDashboard();
 loadSources();
 loadSettings();
+setInterval(() => { if (document.getElementById('page-dashboard').classList.contains('active')) loadDashboard(); }, 30000);
 // 若上次采集仍在后台运行(如定时任务),页面打开后继续显示进度
 (async () => {
   try {

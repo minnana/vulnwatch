@@ -90,3 +90,11 @@ class NotificationReceipt(Base):
     event_key = Column(String(300), primary_key=True)
     status = Column(String(20), nullable=False)
     recorded_at = Column(DateTime, default=config.utcnow, nullable=False)
+
+
+class AIAttempt(Base):
+    __tablename__ = "ai_attempts"
+    id = Column(Integer, primary_key=True)
+    event_key = Column(String(300), nullable=False, index=True)
+    attempted_at = Column(DateTime, default=config.utcnow, nullable=False, index=True)
+    status = Column(String(20), nullable=False)

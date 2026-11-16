@@ -73,6 +73,6 @@ DAILY_HOUR = int(os.getenv("VULNWATCH_DAILY_HOUR", "9"))
 DAILY_MINUTE = int(os.getenv("VULNWATCH_DAILY_MINUTE", "0"))
 
 # ---------- DeepSeek(可选增强) ----------
-AI_MODEL = os.getenv("VULNWATCH_AI_MODEL", "deepseek-chat")
-AI_SUMMARY_LIMIT = int(os.getenv("VULNWATCH_AI_SUMMARY_LIMIT", "5"))  # 每次推送最多生成几条摘要
+AI_MODEL = os.getenv("VULNWATCH_AI_MODEL", "deepseek-flash")
+AI_SUMMARY_LIMIT = int(os.getenv("VULNWATCH_AI_SUMMARY_LIMIT", "5"))  # 默认每轮后台解读条数；网页 ai_batch_limit 可覆盖
 AI_TIMEOUT = int(os.getenv("VULNWATCH_AI_TIMEOUT", "60"))

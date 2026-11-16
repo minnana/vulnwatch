@@ -2,7 +2,7 @@
 from datetime import datetime
 from typing import Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # 支持的采集源类型
@@ -134,3 +134,19 @@ class CollectStatusOut(BaseModel):
     finished_at: Optional[datetime] = None
     results: List[CollectResult] = Field(default_factory=list)
     error: Optional[str] = None
+
+class NotificationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["pending", "selected"] = "pending"
+    ids: List[int] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def check_selection(self):
+        if self.mode == "selected" and not self.ids:
+            raise ValueError("请至少选择一条漏洞")
+        if self.mode == "pending" and self.ids:
+            raise ValueError("待推送模式不能指定漏洞编号")
+        if any(i <= 0 for i in self.ids):
+            raise ValueError("漏洞编号必须为正整数")
+        self.ids = list(dict.fromkeys(self.ids))
+        return self

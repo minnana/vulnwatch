@@ -24,7 +24,10 @@ from .scheduler import (
     end_collection,
     is_collecting,
     parse_hhmm,
-    reschedule_daily_job,
+    reschedule_jobs,
+    collect_with_alerts, dispatch_notifications, runtime_status,
+    notification_preview, notification_selection, channel_config,
+    begin_notification, end_notification, deliver_notifications,
     start_scheduler,
     stop_scheduler,
 )
@@ -32,7 +35,7 @@ from .scheduler import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("vulnwatch")
 
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.3.0"
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 # 访问认证口令:通过环境变量 VULNWATCH_AUTH_TOKEN 设置。
@@ -71,7 +74,7 @@ def _append_result(r: dict) -> None:
 def _run_collect_job() -> None:
     """后台线程:采集全部源,期间持续更新状态供前端轮询。"""
     try:
-        results = collect_all(on_result=_append_result)
+        results = collect_with_alerts(on_result=_append_result)
         with _state_lock:
             _collect_state["results"] = [_public_result(r) for r in results]
     except Exception as e:
@@ -169,7 +172,7 @@ async def add_security_headers(request: Request, call_next):
         "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'",
     )
-    if request.url.path.startswith("/api/"):
+    if request.url.path.startswith("/api/") or request.url.path in ("/", "/static/index.html"):
         # 漏洞/配置数据不缓存,避免共享终端看到过期或他人数据
         response.headers.setdefault("Cache-Control", "no-store")
     return response
@@ -243,6 +246,15 @@ def seed_default_settings(db: Session):
         "include_keywords": "",
         "exclude_keywords": "",
         "required_tags": "",
+        "collect_interval_minutes": "10",
+        "instant_enabled": "true",
+        "instant_threshold": "HIGH",
+        "urgent_bypass_silent": "true",
+        "daily_enabled": "true",
+        "ai_enabled": "true" if crud.get_setting(db, "deepseek_api_key", "") else "false",
+        "ai_model": config.AI_MODEL,
+        "ai_daily_limit": "20",
+        "ai_batch_limit": str(max(1, min(20, config.AI_SUMMARY_LIMIT))),
     }
     existing = crud.get_all_settings(db)
     missing = {k: v for k, v in defaults.items() if k not in existing}
@@ -314,36 +326,59 @@ def api_get_settings(db: Session = Depends(get_db)):
     return crud.get_all_settings(db)
 
 
+def _validated_settings(values):
+    values = dict(values)
+    for key in ("daily_time", "silent_hours_start", "silent_hours_end"):
+        if key in values:
+            raw = values[key].strip()
+            if key == "daily_time" and not raw:
+                values.pop(key)
+            elif parse_hhmm(raw) is None:
+                raise HTTPException(400, f"{key} 格式应为 HH:MM")
+            else:
+                hour, minute = parse_hhmm(raw)
+                values[key] = f"{hour:02d}:{minute:02d}"
+    for key, low, high in (("collect_interval_minutes", 5, 1440), ("ai_daily_limit", 0, 100), ("ai_batch_limit", 1, 20)):
+        if key in values:
+            try:
+                number = int(values[key])
+            except ValueError:
+                raise HTTPException(400, f"{key} 必须为整数")
+            if not low <= number <= high:
+                raise HTTPException(400, f"{key} 必须在 {low} 到 {high} 之间")
+            values[key] = str(number)
+    for key in ("instant_enabled", "daily_enabled", "urgent_bypass_silent", "silent_hours_enabled", "ai_enabled"):
+        if key in values:
+            values[key] = values[key].strip().lower()
+            if values[key] not in ("true", "false"):
+                raise HTTPException(400, f"{key} 必须为 true 或 false")
+    choices = {"notify_channel": set(CHANNEL_KEYS), "instant_threshold": {"HIGH", "CRITICAL"},
+               "alert_threshold": {"CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"}}
+    for key, allowed in choices.items():
+        if key in values and values[key] not in allowed:
+            raise HTTPException(400, f"{key} 的值无效")
+    if "ai_model" in values:
+        import re
+        if not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,100}", values["ai_model"]):
+            raise HTTPException(400, "AI 模型名称无效")
+    return values
+
+
 @app.put("/api/settings/{key}")
 def api_set_setting(key: str, data: schemas.SettingUpdate, db: Session = Depends(get_db)):
-    if key == "daily_time" and parse_hhmm(data.value) is None:
-        raise HTTPException(400, "daily_time 格式应为 HH:MM")
-    crud.set_setting(db, key, data.value)
-    if key == "daily_time":
-        reschedule_daily_job(db)
+    values = _validated_settings({key: data.value})
+    if values:
+        crud.set_settings(db, values)
+        reschedule_jobs(db)
     return {"ok": True}
 
 
 @app.put("/api/settings")
 def api_set_settings(data: schemas.SettingsUpdate, db: Session = Depends(get_db)):
-    """批量保存配置(前端一次请求提交所有项)。"""
-    values = dict(data.values)
-    if "daily_time" in values:
-        raw = (values.get("daily_time") or "").strip()
-        if raw:
-            if parse_hhmm(raw) is None:
-                raise HTTPException(400, "daily_time 格式应为 HH:MM")
-            values["daily_time"] = raw
-        else:
-            # 留空表示沿用默认时间:只跳过该项,不要因为一项为空让整批配置保存失败
-            values.pop("daily_time")
-    channel = values.get("notify_channel")
-    if channel and channel not in CHANNEL_KEYS:
-        raise HTTPException(400, f"不支持的通知通道: {channel}")
+    values = _validated_settings(data.values)
     if values:
         crud.set_settings(db, values)
-    if "daily_time" in values:
-        reschedule_daily_job(db)
+        reschedule_jobs(db)
     return {"ok": True}
 
 
@@ -374,6 +409,8 @@ def api_collect_status():
     if is_collecting() and not state["running"]:
         # 定时任务正在跑(不是 Web 触发的),也告知前端
         state["running"] = True
+        state["results"] = []
+        state["error"] = None
     return state
 
 
@@ -386,10 +423,77 @@ def api_collect_one(source_id: int, db: Session = Depends(get_db)):
     if not begin_collection(blocking=False):
         raise HTTPException(409, "已有采集任务正在运行,请稍后再试")
     try:
+        from .collectors.nvd import invalidate_bulk_cache
+        invalidate_bulk_cache()
         r = collect_source(db, s)
+        if not r.get("error"):
+            threading.Thread(target=dispatch_notifications, daemon=True).start()
         return _public_result(r)
     finally:
         end_collection()
+
+
+# ---------- 手动预览、后台发送与运行策略 ----------
+
+_manual_state = {"running": False, "started_at": None, "finished_at": None, "result": None}
+
+
+@app.get("/api/runtime")
+def api_runtime(db: Session = Depends(get_db)):
+    return runtime_status(db)
+
+
+@app.post("/api/notifications/preview")
+def api_notification_preview(data: schemas.NotificationRequest, db: Session = Depends(get_db)):
+    try:
+        return notification_preview(db, data.mode, data.ids)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+def _run_manual_notification(mode, ids):
+    try:
+        with SessionLocal() as db:
+            result = deliver_notifications(db, mode, ids)
+    except Exception:
+        logger.exception("手动推送失败")
+        result = {"status": "failed", "sent": 0, "detail": "发送异常，请查看服务日志"}
+    finally:
+        with _state_lock:
+            _manual_state.update(running=False, finished_at=config.utcnow(), result=locals().get("result"))
+        end_notification()
+
+
+@app.post("/api/notifications/send", status_code=202)
+def api_notification_send(data: schemas.NotificationRequest, db: Session = Depends(get_db)):
+    try:
+        rows, _ = notification_selection(db, data.mode, data.ids)
+        _, credential, _ = channel_config(db)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if not rows:
+        raise HTTPException(400, "没有符合条件的待推送内容")
+    if not credential:
+        raise HTTPException(400, "请先配置通知通道凭证")
+    if not begin_notification():
+        raise HTTPException(409, "已有推送任务正在运行")
+    with _state_lock:
+        _manual_state.update(running=True, started_at=config.utcnow(), finished_at=None, result=None)
+    try:
+        threading.Thread(target=_run_manual_notification, args=(data.mode, data.ids),
+                         name="vulnwatch-manual-notify", daemon=True).start()
+    except Exception:
+        end_notification()
+        with _state_lock:
+            _manual_state["running"] = False
+        raise HTTPException(503, "无法启动后台推送任务")
+    return {"started": True, "count": len(rows)}
+
+
+@app.get("/api/notifications/status")
+def api_notification_status():
+    with _state_lock:
+        return dict(_manual_state)
 
 
 # ---------- 通知测试 ----------
