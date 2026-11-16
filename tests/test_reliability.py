@@ -34,7 +34,7 @@ class ReliabilityTests(unittest.TestCase):
         self.db = SessionLocal()
         self.source = crud.create_source(self.db, MonitorSourceCreate(
             name="test", category="Test", source_type="html", url="https://example.com"))
-        crud.set_settings(self.db, {"dingtalk_webhook": "test-placeholder", "alert_threshold": "HIGH"})
+        crud.set_settings(self.db, {"dingtalk_webhook": "test-placeholder", "alert_threshold": "HIGH", "instant_threshold": "HIGH", "instant_batch_minutes": "0"})
 
     def tearDown(self):
         self.db.close()
@@ -382,6 +382,159 @@ class ReliabilityTests(unittest.TestCase):
             scheduler.collect_all()
             invalidate.assert_called_once()
         self.assertEqual(nvd._bulk_state["expires"], 0)
+
+
+    def test_default_policy_is_quiet_and_explicit(self):
+        from app.main import seed_default_settings
+        self.db.query(models.Setting).filter(models.Setting.key.in_(["instant_threshold", "instant_batch_minutes"])).delete()
+        self.db.commit()
+        seed_default_settings(self.db)
+        self.assertEqual(crud.get_setting(self.db, "instant_threshold"), "CRITICAL")
+        self.assertEqual(crud.get_setting(self.db, "instant_batch_minutes"), "5")
+        self.assertEqual(crud.get_setting(self.db, "collect_enabled"), "true")
+        self.assertEqual(crud.get_setting(self.db, "notifications_enabled"), "true")
+        self.assertEqual(crud.get_setting(self.db, "alert_max_age_days"), "7")
+
+    def test_detection_switch_removes_job_but_preserves_manual_path(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+        headers = {"Authorization": "Bearer test-only-token"}
+        with TestClient(app) as client:
+            response = client.put("/api/settings/collect_enabled", headers=headers, json={"value": "false"})
+            self.assertEqual(response.status_code, 200)
+            self.assertIsNone(scheduler.scheduler.get_job(scheduler.POLL_JOB_ID))
+            with patch.object(scheduler, "collect_with_alerts") as collect:
+                scheduler.run_poll_job()
+                collect.assert_not_called()
+            with patch.object(scheduler, "get_collector", return_value=SimpleNamespace(collect=lambda: [])), \
+                 patch("app.main.dispatch_notifications"):
+                self.assertEqual(client.post(f"/api/collect/{self.source.id}", headers=headers).status_code, 200)
+            client.put("/api/settings/collect_enabled", headers=headers, json={"value": "true"})
+            self.assertIsNotNone(scheduler.scheduler.get_job(scheduler.POLL_JOB_ID))
+
+    def test_notification_switch_pauses_both_automatic_modes_only(self):
+        self.collect([])
+        self.collect([item()])
+        crud.set_setting(self.db, "notifications_enabled", "false")
+        with patch.object(scheduler, "send", return_value=True) as send:
+            self.assertEqual(scheduler.dispatch_notifications()["status"], "disabled")
+            self.assertEqual(scheduler.run_daily_job()["status"], "disabled")
+            send.assert_not_called()
+            self.assertEqual(scheduler.deliver_notifications(self.db, "pending")["sent"], 1)
+
+    def test_high_alerts_merge_across_sources_and_keep_fixed_deadline(self):
+        from datetime import timedelta
+        self.collect([])
+        other = crud.create_source(self.db, MonitorSourceCreate(name="other", category="Test", source_type="html", url="https://example.com"))
+        self.collect([], other)
+        self.collect([item()])
+        crud.set_setting(self.db, "instant_batch_minutes", "5")
+        start = config.utcnow()
+        with patch.object(scheduler, "send", return_value=True) as send:
+            self.assertEqual(scheduler.dispatch_notifications()["status"], "buffered")
+            self.collect([item("CVE-2099-4000")], other)
+            self.assertEqual(scheduler.dispatch_notifications()["sent"], 0)
+            with patch.object(config, "utcnow", return_value=start + timedelta(minutes=6)):
+                self.assertEqual(scheduler.dispatch_notifications()["sent"], 2)
+            send.assert_called_once()
+            self.assertEqual(scheduler.run_daily_job()["sent"], 0)
+
+    def test_critical_and_kev_bypass_high_merge_window(self):
+        self.collect([])
+        self.collect([item(), dict(item("CVE-2099-4001"), severity="CRITICAL"), item("CVE-2099-4002", True)])
+        crud.set_setting(self.db, "instant_batch_minutes", "60")
+        with patch.object(scheduler, "send", return_value=True):
+            self.assertEqual(scheduler.dispatch_notifications()["sent"], 2)
+            self.assertEqual(len(crud.pending_notifications(self.db)), 1)
+
+    def test_historical_backfill_is_stored_but_not_automatically_notified(self):
+        from datetime import datetime
+        self.collect([])
+        self.collect([dict(item("CVE-2002-0898"), severity="CRITICAL", published_at=datetime(2002,10,4)),
+                      dict(item("CVE-2006-2855"), published_at=datetime(2006,6,6)),
+                      dict(item("CVE-2010-3458", True), published_at=datetime(2010,9,17)),
+                      item("CVE-2099-4003")])
+        with patch.object(scheduler, "send", return_value=True):
+            self.assertEqual(scheduler.dispatch_notifications()["sent"], 2)
+            self.assertEqual(scheduler.run_daily_job()["sent"], 0)
+        self.assertEqual(self.db.query(models.Vulnerability).count(), 4)
+        old = self.db.query(models.Vulnerability).filter_by(cve_id="CVE-2002-0898").one()
+        self.assertEqual(scheduler.notification_preview(self.db, "selected", [old.id])["count"], 1)
+
+    def test_failed_eligible_alert_does_not_age_out(self):
+        from datetime import timedelta
+        now = config.utcnow()
+        self.collect([])
+        self.collect([dict(item(), published_at=now - timedelta(days=1))])
+        with patch.object(scheduler, "send", return_value=False):
+            scheduler.dispatch_notifications()
+        scheduler._retry_after = 0
+        with patch.object(config, "utcnow", return_value=now + timedelta(days=30)), \
+             patch.object(scheduler, "send", return_value=True):
+            self.assertEqual(scheduler.dispatch_notifications()["sent"], 1)
+
+    def test_cross_source_same_cve_normalized_and_never_repeated(self):
+        self.collect([])
+        other = crud.create_source(self.db, MonitorSourceCreate(name="other", category="Test", source_type="html", url="https://example.com"))
+        self.collect([], other)
+        self.collect([item(" cve-2099-4100 ")])
+        self.collect([item("CVE-2099-4100")], other)
+        self.assertEqual(self.db.query(models.Vulnerability).count(), 2)
+        self.assertEqual(len(scheduler.notification_selection(self.db)[0]), 1)
+        with patch.object(scheduler, "send", return_value=True) as send:
+            self.assertEqual(scheduler.dispatch_notifications()["sent"], 1)
+            with SessionLocal() as db:
+                self.assertEqual(crud.pending_notifications(db), [])
+            self.assertEqual(scheduler.run_daily_job()["sent"], 0)
+            send.assert_called_once()
+
+    def test_kev_upgrade_can_be_suppressed_without_losing_first_kev(self):
+        self.collect([])
+        self.collect([item()])
+        with patch.object(scheduler, "send", return_value=True):
+            scheduler.dispatch_notifications()
+        crud.set_setting(self.db, "notify_kev_upgrade", "false")
+        self.collect([item(kev=True), item("CVE-2099-4200", True)])
+        with patch.object(scheduler, "send", return_value=True):
+            self.assertEqual(scheduler.dispatch_notifications()["sent"], 1)
+        crud.set_setting(self.db, "notify_kev_upgrade", "true")
+        with patch.object(scheduler, "send", return_value=True):
+            self.assertEqual(scheduler.dispatch_notifications()["sent"], 1)
+
+    def test_disabling_kev_upgrade_does_not_suppress_baseline_escalation(self):
+        self.collect([item()])
+        crud.set_setting(self.db, "notify_kev_upgrade", "false")
+        self.collect([item(kev=True)])
+        with patch.object(scheduler, "send", return_value=True):
+            self.assertEqual(scheduler.dispatch_notifications()["sent"], 1)
+
+    def test_notification_pause_is_checked_between_chunks(self):
+        self.collect([])
+        self.collect([item(f"CVE-2099-{i:04}") for i in range(60)])
+        def pause_after_send(*args):
+            with SessionLocal() as db:
+                crud.set_setting(db, "notifications_enabled", "false")
+            return True
+        with patch.object(scheduler, "send", side_effect=pause_after_send) as send:
+            result = scheduler.run_daily_job()
+            self.assertEqual(result["status"], "paused")
+            self.assertGreater(result["sent"], 0)
+            self.assertLess(result["sent"], 60)
+            send.assert_called_once()
+        self.assertGreater(len(crud.pending_notifications(self.db)), 0)
+
+    def test_new_policy_validation_and_no_cve_scope(self):
+        from fastapi import HTTPException
+        from app.main import _validated_settings
+        for values in ({"collect_enabled":"maybe"}, {"notifications_enabled":"1"},
+                       {"instant_batch_minutes":"61"}, {"alert_max_age_days":"-1"},
+                       {"notify_kev_upgrade":"yes"}):
+            with self.assertRaises(HTTPException):
+                _validated_settings(values)
+        self.assertEqual(_validated_settings({"instant_batch_minutes":"0", "alert_max_age_days":"0"}),
+                         {"instant_batch_minutes":"0", "alert_max_age_days":"0"})
+        rows = [{"source_id":1,"unique_key":"advisory-1"}, {"source_id":2,"unique_key":"advisory-1"}]
+        self.assertEqual(len(scheduler._dedup_by_cve(rows)), 2)
 
 
 if __name__ == "__main__":

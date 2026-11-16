@@ -35,7 +35,7 @@ from .scheduler import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("vulnwatch")
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 # 访问认证口令:通过环境变量 VULNWATCH_AUTH_TOKEN 设置。
@@ -248,7 +248,12 @@ def seed_default_settings(db: Session):
         "required_tags": "",
         "collect_interval_minutes": "10",
         "instant_enabled": "true",
-        "instant_threshold": "HIGH",
+        "instant_threshold": "CRITICAL",
+        "collect_enabled": "true",
+        "notifications_enabled": "true",
+        "instant_batch_minutes": "5",
+        "alert_max_age_days": "7",
+        "notify_kev_upgrade": "true",
         "urgent_bypass_silent": "true",
         "daily_enabled": "true",
         "ai_enabled": "true" if crud.get_setting(db, "deepseek_api_key", "") else "false",
@@ -338,7 +343,7 @@ def _validated_settings(values):
             else:
                 hour, minute = parse_hhmm(raw)
                 values[key] = f"{hour:02d}:{minute:02d}"
-    for key, low, high in (("collect_interval_minutes", 5, 1440), ("ai_daily_limit", 0, 100), ("ai_batch_limit", 1, 20)):
+    for key, low, high in (("collect_interval_minutes", 5, 1440), ("instant_batch_minutes", 0, 60), ("alert_max_age_days", 0, 365), ("ai_daily_limit", 0, 100), ("ai_batch_limit", 1, 20)):
         if key in values:
             try:
                 number = int(values[key])
@@ -347,7 +352,7 @@ def _validated_settings(values):
             if not low <= number <= high:
                 raise HTTPException(400, f"{key} 必须在 {low} 到 {high} 之间")
             values[key] = str(number)
-    for key in ("instant_enabled", "daily_enabled", "urgent_bypass_silent", "silent_hours_enabled", "ai_enabled"):
+    for key in ("instant_enabled", "daily_enabled", "urgent_bypass_silent", "silent_hours_enabled", "ai_enabled", "collect_enabled", "notifications_enabled", "notify_kev_upgrade"):
         if key in values:
             values[key] = values[key].strip().lower()
             if values[key] not in ("true", "false"):

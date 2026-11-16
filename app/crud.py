@@ -66,7 +66,7 @@ def _clean(data: dict) -> dict:
         if isinstance(v, str) and not v.strip():
             v = None
         if k == "cve_id" and isinstance(v, str):
-            v = v.upper()
+            v = v.strip().upper()
         clean[k] = v
     if not clean.get("title"):
         clean["title"] = clean.get("cve_id") or clean.get("unique_key") or "未命名漏洞"
@@ -238,14 +238,22 @@ def record_collection(db: Session, source_id: int, fetched: int, new_count: int,
 
 
 def pending_notifications(db: Session):
-    acknowledged = {r[0] for r in db.query(models.NotificationReceipt.event_key).all()}
+    acknowledged = dict(db.query(models.NotificationReceipt.event_key, models.NotificationReceipt.status).all())
+    notify_upgrade = get_setting(db, "notify_kev_upgrade", "true") == "true"
     rows = (db.query(models.Vulnerability)
             .join(models.SourceCollectionState,
                   models.SourceCollectionState.source_id == models.Vulnerability.source_id)
             .join(models.MonitorSource, models.MonitorSource.id == models.Vulnerability.source_id)
             .filter(models.SourceCollectionState.first_success_at.isnot(None),
                     models.MonitorSource.enabled.is_(True)).all())
-    return [v for v in rows if notification_key(v) not in acknowledged]
+    def pending(v):
+        key = notification_key(v)
+        if key in acknowledged:
+            return False
+        if not notify_upgrade and key.endswith(":kev") and acknowledged.get(key[:-4] + ":normal") == "sent":
+            return False
+        return True
+    return [v for v in rows if pending(v)]
 
 
 def stats(db: Session, days: int = 7) -> dict:

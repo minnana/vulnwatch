@@ -12,6 +12,7 @@
 import logging
 import re
 import threading
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import monotonic
 from typing import Callable, List, Optional, Tuple
@@ -253,7 +254,7 @@ def _dedup_by_cve(vulns: List) -> List:
     seen_key = set()
     out = []
     for v in ordered:
-        cve_id = (_field(v, "cve_id") or "").upper()
+        cve_id = (_field(v, "cve_id") or "").strip().upper()
         unique_key = (_field(v, "source_id"), _field(v, "unique_key")) if _field(v, "unique_key") else None
         if cve_id:
             if cve_id in seen_cve:
@@ -270,6 +271,22 @@ def _dedup_by_cve(vulns: List) -> List:
     return out
 
 
+def _recent_discovery(v, max_age_days):
+    """Compare publication with discovery, so delayed/failed alerts never age out."""
+    if not max_age_days or _field(v, "is_kev"):
+        return True
+    published = _field(v, "published_at")
+    discovered = _field(v, "first_seen_at") or config.utcnow()
+    def utc(value):
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+    try:
+        return not published or utc(published) >= utc(discovered) - timedelta(days=max_age_days)
+    except (ValueError, TypeError, AttributeError):
+        return True
+
+
 def _filter_to_push(db, new_vulns: List, threshold: str) -> List:
     """完整的推送过滤流水线:等级阈值 → 产品黑白名单 → 标签 → 跨源去重。"""
     rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
@@ -279,8 +296,11 @@ def _filter_to_push(db, new_vulns: List, threshold: str) -> List:
     exclude = _parse_csv(crud.get_setting(db, "exclude_keywords", ""))
     required_tags = _parse_csv(crud.get_setting(db, "required_tags", ""))
 
+    max_age_days = int(crud.get_setting(db, "alert_max_age_days", "7"))
     result = []
     for v in new_vulns:
+        if not _recent_discovery(v, max_age_days):
+            continue
         # 1. 等级阈值(在野利用 KEV 强制保留)
         if not (_field(v, "is_kev") or rank.get((_field(v, "severity") or "UNKNOWN").upper(), 4) <= th_rank):
             continue
@@ -330,7 +350,8 @@ def notification_selection(db, mode="pending", ids=None):
         if len(rows) != len(set(ids or [])):
             raise ValueError("部分所选漏洞已不存在，请刷新列表")
         return _dedup_by_cve(rows), "MANUAL"
-    threshold = (crud.get_setting(db, "instant_threshold" if mode == "instant" else "alert_threshold", "HIGH") or "HIGH").upper()
+    default = "CRITICAL" if mode == "instant" else "HIGH"
+    threshold = (crud.get_setting(db, "instant_threshold" if mode == "instant" else "alert_threshold", default) or default).upper()
     return _filter_to_push(db, crud.pending_notifications(db), threshold), threshold
 
 
@@ -356,9 +377,22 @@ def notification_preview(db, mode="pending", ids=None):
                     else "发送符合过滤条件的待推送内容；已成功发送和首次历史基线不重复发送。手动操作不受静默时段限制。"}
 
 
+def instant_batch_due(db, rows):
+    regular = [v for v in rows if not v.is_kev and v.severity != "CRITICAL"]
+    if not regular:
+        return None
+    minutes = int(crud.get_setting(db, "instant_batch_minutes", "5"))
+    return min(v.first_seen_at or config.utcnow() for v in regular) + timedelta(minutes=minutes)
+
+
+def _automatic_enabled(db, mode):
+    return (setting_bool(db, "notifications_enabled", True)
+            and setting_bool(db, "instant_enabled" if mode == "instant" else "daily_enabled", True))
+
+
 def deliver_notifications(db, mode="instant", ids=None):
     """Caller owns the notification lock. AI calls never block this path."""
-    if mode == "instant" and not setting_bool(db, "instant_enabled", True):
+    if mode in ("instant", "daily") and not _automatic_enabled(db, mode):
         return {"status": "disabled", "sent": 0, "count": 0}
     rows, threshold = notification_selection(db, mode, ids)
     label = {"instant": "即时告警", "daily": "每日汇总",
@@ -368,8 +402,14 @@ def deliver_notifications(db, mode="instant", ids=None):
         # Severe / actively exploited alerts may bypass quiet hours by explicit policy.
         rows = [v for v in rows if setting_bool(db, "urgent_bypass_silent", True)
                 and (v.is_kev or v.severity == "CRITICAL")]
+    buffered = False
+    if mode == "instant" and rows:
+        due = instant_batch_due(db, rows)
+        if due and config.utcnow() < due:
+            buffered = True
+            rows = [v for v in rows if v.is_kev or v.severity == "CRITICAL"]
     if not rows:
-        status = "silent" if original_count else "skipped"
+        status = "buffered" if buffered else ("silent" if original_count else "skipped")
         if mode != "instant":
             _log_alert(db, threshold, 0, status, f"{label}: 待推送 {original_count} 条，当前无可发送内容")
         return {"status": status, "sent": 0, "count": original_count}
@@ -383,6 +423,9 @@ def deliver_notifications(db, mode="instant", ids=None):
     sent_count = 0
     status = "success"
     for message, batch in batches:
+        if mode in ("instant", "daily") and not _automatic_enabled(db, mode):
+            status = "paused"
+            break
         if not _rate_limited_send(channel, credential, secret, titles[mode], message):
             status = "failed"
             break
@@ -391,6 +434,8 @@ def deliver_notifications(db, mode="instant", ids=None):
     detail = f"{label}: 已发送 {sent_count}/{len(rows)} 条，共 {len(batches)} 段，通道 {channel}"
     if status == "failed":
         detail += "；失败内容未确认，可重试"
+    elif status == "paused":
+        detail += "；自动推送已暂停，剩余内容保留"
     _log_alert(db, threshold, sent_count, status, detail)
     return {"status": status, "sent": sent_count, "count": len(rows), "parts": len(batches), "detail": detail}
 
@@ -442,6 +487,10 @@ def collect_with_alerts(on_result=None):
 
 
 def run_poll_job():
+    from .database import SessionLocal
+    with SessionLocal() as db:
+        if not setting_bool(db, "collect_enabled", True):
+            return
     if not begin_collection():
         return
     try:
@@ -490,7 +539,7 @@ def reschedule_daily_job(db=None):
     try:
         hour, minute = _configured_daily_time(db)
         if scheduler.running:
-            if setting_bool(db, "daily_enabled", True):
+            if setting_bool(db, "daily_enabled", True) and setting_bool(db, "notifications_enabled", True):
                 current = scheduler.get_job(DAILY_JOB_ID)
                 if current and str(current.trigger) == str(_daily_trigger(hour, minute)):
                     return hour, minute
@@ -507,6 +556,10 @@ def reschedule_daily_job(db=None):
 def reschedule_jobs(db):
     reschedule_daily_job(db)
     if scheduler.running:
+        if not setting_bool(db, "collect_enabled", True):
+            if scheduler.get_job(POLL_JOB_ID):
+                scheduler.remove_job(POLL_JOB_ID)
+            return
         minutes = int(crud.get_setting(db, "collect_interval_minutes", "10"))
         current = scheduler.get_job(POLL_JOB_ID)
         if current and current.trigger.interval.total_seconds() == minutes * 60:
@@ -544,7 +597,13 @@ def runtime_status(db):
     return {"timezone": config.TIMEZONE_NAME, "collecting": is_collecting(), "notifying": is_notifying(),
             "collect_interval_minutes": int(crud.get_setting(db, "collect_interval_minutes", "10")),
             "instant_enabled": setting_bool(db, "instant_enabled", True),
-            "instant_threshold": crud.get_setting(db, "instant_threshold", "HIGH"),
+            "instant_threshold": crud.get_setting(db, "instant_threshold", "CRITICAL"),
+            "collect_enabled": setting_bool(db, "collect_enabled", True),
+            "notifications_enabled": setting_bool(db, "notifications_enabled", True),
+            "instant_batch_minutes": int(crud.get_setting(db, "instant_batch_minutes", "5")),
+            "next_batch_at": instant_batch_due(db, urgent) if _automatic_enabled(db, "instant") else None,
+            "alert_max_age_days": int(crud.get_setting(db, "alert_max_age_days", "7")),
+            "notify_kev_upgrade": setting_bool(db, "notify_kev_upgrade", True),
             "daily_enabled": setting_bool(db, "daily_enabled", True),
             "daily_time": crud.get_setting(db, "daily_time", "09:00"),
             "next_collect_at": jobs.get(POLL_JOB_ID), "next_daily_at": jobs.get(DAILY_JOB_ID),

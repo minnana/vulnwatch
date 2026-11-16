@@ -127,8 +127,13 @@
         </div>
       </div>
       <div class="card">
-        <h2>监测与告警策略 <span class="badge low">v0.3.0</span></h2>
+        <h2>监测与告警策略 <span class="badge low">v0.3.1</span></h2>
         <div id="runtime-status" class="hint">加载运行状态…</div>
+        <div class="toolbar" style="margin-top:12px;margin-bottom:0">
+          <button class="btn small secondary" id="collect-toggle" disabled onclick="togglePolicy('collect_enabled',this.dataset.next==='true')">加载检测开关…</button>
+          <button class="btn small secondary" id="notify-toggle" disabled onclick="togglePolicy('notifications_enabled',this.dataset.next==='true')">加载推送开关…</button>
+          <button class="btn small secondary" onclick="document.querySelector('.nav-item[data-page=settings]').click()">详细设置</button>
+        </div>
       </div>
       <div class="card">
         <div class="toolbar">
@@ -236,6 +241,32 @@
     <!-- 配置 -->
     <div class="page" id="page-settings">
       <h1>系统配置</h1>
+      <div class="card" id="monitor-policy">
+        <h2>⏱️ 自动检测与推送</h2>
+        <div class="toolbar">
+          <button class="btn small secondary" onclick="applyPushPreset('quiet')">安静模式（推荐）</button>
+          <button class="btn small secondary" onclick="applyPushPreset('batch')">高危合并提醒</button>
+          <button class="btn small secondary" onclick="applyPushPreset('daily')">仅每日汇总</button>
+        </div>
+        <p class="hint">快捷方案点击即保存：安静模式只即时通知严重 / KEV，普通高危留到每日汇总；合并模式把普通高危先汇集 5 分钟；仅日报会关闭即时告警。</p>
+        <div class="grid-2" style="margin-top:16px">
+          <div class="form-row"><label><input type="checkbox" id="set-collect-enabled" checked> 启用定时检测</label><div class="hint">关闭后停止后续自动采集，当前这一轮仍会完成，手动检测仍可用。</div></div>
+          <div class="form-row"><label><input type="checkbox" id="set-notifications-enabled" checked> 启用自动推送</label><div class="hint">关闭后即时告警和每日汇总暂停，待推送内容保留，手动发送仍可用。</div></div>
+        </div>
+        <div class="grid-2">
+          <div class="form-row"><label for="set-interval">检测间隔（分钟，5–1440）</label><input type="number" id="set-interval" min="5" max="1440" value="10"></div>
+          <div class="form-row"><label><input type="checkbox" id="set-instant" checked> 启用即时告警</label><select aria-label="即时推送等级" id="set-instant-threshold"><option value="CRITICAL">严重及 KEV（安静模式）</option><option value="HIGH">高危、严重及 KEV</option></select></div>
+        </div>
+        <div class="grid-2">
+          <div class="form-row"><label for="set-batch-minutes">普通高危合并窗口（分钟，0–60）</label><input type="number" id="set-batch-minutes" min="0" max="60" value="5"><div class="hint">仅在高危也即时推送时生效。到期统一发送窗口内的高危；严重 / KEV 不等待。0 表示不合并。</div></div>
+          <div class="form-row"><label for="set-max-age">历史公告过滤（天，0–365）</label><input type="number" id="set-max-age" min="0" max="365" value="7"><div class="hint">发布日期早于首次入库超过此天数，仅入库不自动推送。0 表示不限；KEV 不受限制，无发布日期按首次入库判断。</div></div>
+        </div>
+        <div class="form-row"><label><input type="checkbox" id="set-kev-upgrade" checked> 已推送漏洞后来列入 KEV 时，再提醒一次</label></div>
+        <p class="hint">相同 CVE 跨源、跨轮和重启后均去重；无 CVE 按来源及公告标识去重，不凭相似标题合并。手动指定记录允许重发。延迟或失败内容不会因等待太久被历史过滤丢弃。</p>
+        <p class="hint">普通高危默认在每日汇总发送；严重 / KEV 采集后即时发送。消息超出通道长度会分条，失败每分钟检查重试。</p>
+        <button class="btn" onclick="saveSettings()" style="margin-top:12px">保存检测与推送设置</button>
+      </div>
+
       <div class="card">
         <h2>🔔 通知通道</h2>
         <div class="form-row">
@@ -269,7 +300,7 @@
             <option value="MEDIUM">中危及以上</option>
             <option value="LOW">低危及以上</option><option value="UNKNOWN">全部（含未知）</option>
           </select>
-          <div class="hint">影响每日汇总和手动待推送；即时告警等级在下方单独设置。KEV 绕过等级阈值，但仍受产品关键词与标签筛选。</div>
+          <div class="hint">影响每日汇总和手动待推送；即时告警等级在上方单独设置。KEV 绕过等级阈值，但仍受产品关键词与标签筛选。</div>
         </div>
         <div class="form-row">
           <label>产品关键词白名单(逗号分隔,留空=全部)</label>
@@ -312,13 +343,6 @@
         <p class="hint">流程：先发原始告警 → 后台每分钟处理已推送且没有摘要的记录 → 缓存到漏洞列表；后续手动推送可附带已有摘要。首次历史基线不批量调用 AI，不为摘要再补发一轮通知。</p>
         <p class="hint">仅发送该条公告资料到 DeepSeek；未配置 Key、关闭开关或调用失败，采集和通知仍照常运行。调用按你的 DeepSeek 账号计费；次数上限不是金额上限。失败至少间隔一小时再试，已有摘要复用。</p>
         <div id="ai-status" class="hint"></div>
-      </div>
-      <div class="card">
-        <h2>⏱️ 定期检测与即时告警</h2>
-        <div class="form-row"><label for="set-interval">采集间隔（分钟，5–1440）</label><input type="number" id="set-interval" min="5" max="1440" value="10"></div>
-        <div class="form-row"><label><input type="checkbox" id="set-instant" checked> 采集到符合条件的新漏洞后立即推送</label></div>
-        <div class="form-row"><label for="set-instant-threshold">即时推送等级</label><select id="set-instant-threshold"><option value="HIGH">高危、严重及 KEV</option><option value="CRITICAL">严重及 KEV</option></select></div>
-        <p class="hint">每个源采集完成即可触发告警，不必等其他源结束。失败内容每分钟重试；已成功发送的不在每日汇总中重复发送。时效受采集间隔、请求耗时与情报源更新速度影响。</p>
       </div>
       <div class="card">
         <h2>⏰ 每日汇总</h2>
@@ -464,7 +488,7 @@ async function loadDashboard() {
     document.getElementById('stat-high').textContent = d.high;
     document.getElementById('stat-kev').textContent = d.kev;
     const alerts = await get('/api/alerts?limit=10');
-    const names = {success:'发送成功',failed:'失败',baseline:'建立基线',skipped:'无待推送内容',silent:'静默延期'};
+    const names = {success:'发送成功',failed:'失败',baseline:'建立基线',skipped:'无待推送内容',silent:'静默延期',paused:'已暂停'};
     document.getElementById('alert-history').innerHTML = alerts.length ? alerts.map(a =>
       `<div class="collect-line">${esc(fmtTime(a.triggered_at))} · ${esc(names[a.status] || a.status)} · ${esc(a.detail || '')}</div>`
     ).join('') : '暂无推送记录；新漏洞将按即时告警和每日汇总策略处理。';
@@ -689,7 +713,12 @@ async function loadSettings() {
   document.getElementById('set-time').value = d.daily_time || '09:00';
   document.getElementById('set-interval').value = d.collect_interval_minutes || '10';
   document.getElementById('set-instant').checked = d.instant_enabled !== 'false';
-  document.getElementById('set-instant-threshold').value = d.instant_threshold || 'HIGH';
+  document.getElementById('set-instant-threshold').value = d.instant_threshold || 'CRITICAL';
+  document.getElementById('set-collect-enabled').checked = d.collect_enabled !== 'false';
+  document.getElementById('set-notifications-enabled').checked = d.notifications_enabled !== 'false';
+  document.getElementById('set-kev-upgrade').checked = d.notify_kev_upgrade !== 'false';
+  document.getElementById('set-batch-minutes').value = d.instant_batch_minutes ?? '5';
+  document.getElementById('set-max-age').value = d.alert_max_age_days ?? '7';
   document.getElementById('set-urgent-bypass').checked = d.urgent_bypass_silent !== 'false';
   document.getElementById('set-daily-enabled').checked = d.daily_enabled !== 'false';
   document.getElementById('set-ai-enabled').checked = d.ai_enabled === 'true';
@@ -736,6 +765,11 @@ function collectSettings() {
     collect_interval_minutes: document.getElementById('set-interval').value,
     instant_enabled: String(document.getElementById('set-instant').checked),
     instant_threshold: document.getElementById('set-instant-threshold').value,
+    collect_enabled: String(document.getElementById('set-collect-enabled').checked),
+    notifications_enabled: String(document.getElementById('set-notifications-enabled').checked),
+    notify_kev_upgrade: String(document.getElementById('set-kev-upgrade').checked),
+    instant_batch_minutes: document.getElementById('set-batch-minutes').value,
+    alert_max_age_days: document.getElementById('set-max-age').value,
     urgent_bypass_silent: String(document.getElementById('set-urgent-bypass').checked),
     daily_enabled: String(document.getElementById('set-daily-enabled').checked),
     ai_enabled: String(document.getElementById('set-ai-enabled').checked),
@@ -789,10 +823,19 @@ function fmtTime(value) {
 async function loadRuntime() {
   const d = await get('/api/runtime');
   runtimeTimezone = d.timezone || 'Asia/Shanghai';
+  const auto = d.notifications_enabled;
   document.getElementById('runtime-status').innerHTML =
-    `<div>每 <b>${d.collect_interval_minutes} 分钟</b>采集 · 即时告警 <b>${d.instant_enabled ? (d.instant_threshold === 'HIGH' ? '高危 / 严重 / KEV' : '严重 / KEV') : '已关闭'}</b> · 每日汇总 ${d.daily_enabled ? esc(d.daily_time) : '已关闭'}（${esc(runtimeTimezone)}）</div>
-     <div>下次采集：${esc(fmtTime(d.next_collect_at))} · 下次汇总：${esc(fmtTime(d.next_daily_at))}</div>
-     <div>最近采集：${esc(fmtTime(d.last_collect_at))} · 待推送：<b>${d.pending}</b> 条，其中即时告警 ${d.urgent_pending} 条 ${d.collecting ? ' · 正在采集…' : ''} ${d.notifying ? ' · 正在推送…' : ''}</div>`;
+    `<div>自动检测 <b>${d.collect_enabled ? '开启 · 每 ' + d.collect_interval_minutes + ' 分钟' : '已暂停'}</b> · 自动推送 <b>${auto ? '开启' : '已暂停'}</b></div>
+     <div>即时告警：${auto && d.instant_enabled ? (d.instant_threshold === 'HIGH' ? '严重 / KEV 立即，普通高危合并 ' + d.instant_batch_minutes + ' 分钟' : '严重 / KEV 立即，普通高危留到每日汇总') : '已关闭或暂停'} · 每日汇总：${auto && d.daily_enabled ? esc(d.daily_time) : '已关闭或暂停'}（${esc(runtimeTimezone)}）</div>
+     <div>下次检测：${esc(fmtTime(d.next_collect_at))} · 下次汇总：${esc(fmtTime(d.next_daily_at))}</div>
+     <div>最近采集：${esc(fmtTime(d.last_collect_at))} · 待推送：<b>${d.pending}</b> 条${d.collecting ? ' · 正在采集…' : ''}${d.notifying ? ' · 正在推送…' : ''}</div>
+     <div>历史公告过滤：${d.alert_max_age_days ? d.alert_max_age_days + ' 天（KEV 除外）' : '不限'} · 跨源 CVE 去重已启用${d.next_batch_at ? ' · 高危合并到期：' + esc(fmtTime(d.next_batch_at)) : ''}</div>`;
+  for (const [id, enabled] of [['collect-toggle',d.collect_enabled],['notify-toggle',auto]]) {
+    const button = document.getElementById(id);
+    button.disabled = false;
+    button.dataset.next = String(!enabled);
+    button.textContent = (enabled ? '暂停' : '恢复') + (id === 'collect-toggle' ? '定时检测' : '自动推送');
+  }
   document.getElementById('ai-status').textContent =
     `${d.ai.enabled ? '增强开关已启用' : '增强开关已关闭'} · ${d.ai.configured ? '已配置 Key' : '尚未配置 Key'} · 今日调用 ${d.ai.calls_today}/${d.ai.daily_limit} 次${d.ai.last_status ? ' · 最近结果：' + ({success:'成功',failed:'失败，稍后重试',running:'处理中'}[d.ai.last_status] || d.ai.last_status) : ''}`;
 }
@@ -858,6 +901,31 @@ async function pollPushStatus() {
   }
 }
 
+
+
+async function togglePolicy(key, enabled) {
+  const button = document.getElementById(key === 'collect_enabled' ? 'collect-toggle' : 'notify-toggle');
+  button.disabled = true;
+  try {
+    await send('PUT', '/api/settings/' + key, {value:String(enabled)});
+    await loadRuntime();
+    toast((key === 'collect_enabled' ? '定时检测' : '自动推送') + (enabled ? '已恢复' : '已暂停'));
+  } catch (e) { button.disabled = false; toast('设置失败：' + e.message); }
+}
+
+async function applyPushPreset(preset) {
+  const values = {
+    notifications_enabled:'true', daily_enabled:'true', alert_threshold:'HIGH',
+    instant_enabled:preset === 'daily' ? 'false' : 'true',
+    instant_threshold:preset === 'batch' ? 'HIGH' : 'CRITICAL',
+    instant_batch_minutes:'5',
+  };
+  try {
+    await send('PUT', '/api/settings', {values});
+    await loadSettings();
+    toast('推送方案已保存并生效');
+  } catch (e) { toast('保存方案失败：' + e.message); }
+}
 
 // ---------- 初始化 ----------
 loadDashboard();
