@@ -8,6 +8,7 @@ import feedparser
 
 from .. import config
 from .base import BaseCollector
+from .severity import guess_severity
 
 
 class RssCollector(BaseCollector):
@@ -21,6 +22,8 @@ class RssCollector(BaseCollector):
         if resp.status_code != 200:
             return []
         feed = feedparser.parse(resp.content)
+        if feed.bozo and not feed.entries:
+            raise RuntimeError("RSS 响应无法解析，可能为错误页或源格式已变化")
         keywords = [k.strip().lower() for k in (self.source.keyword or "").split(",") if k.strip()]
         cutoff = config.utcnow() - timedelta(days=self.DAYS)
 
@@ -65,16 +68,7 @@ class RssCollector(BaseCollector):
 
     @staticmethod
     def _guess_severity(text: str) -> str:
-        t = text.upper()
-        if any(w in t for w in ("CRITICAL", "严重", "RCE", "REMOTE CODE", "IN-THE-WILD", "在野", "ACTIVELY EXPLOITED")):
-            return "CRITICAL"
-        if any(w in t for w in ("HIGH", "高危", "IMPORTANT")):
-            return "HIGH"
-        if any(w in t for w in ("MEDIUM", "MODERATE", "中危")):
-            return "MEDIUM"
-        if any(w in t for w in ("LOW", "低危")):
-            return "LOW"
-        return "UNKNOWN"
+        return guess_severity(text)
 
     @staticmethod
     def _parse_date(entry):

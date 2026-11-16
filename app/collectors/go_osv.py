@@ -5,6 +5,8 @@ from typing import List
 
 from .. import config
 from .base import BaseCollector
+from .severity import guess_severity
+import re
 
 
 class GoOsvCollector(BaseCollector):
@@ -86,13 +88,14 @@ class GoOsvCollector(BaseCollector):
     @staticmethod
     def _guess_severity(text: str) -> str:
         t = (text or "").upper()
-        if any(w in t for w in ("CRITICAL", "RCE", "REMOTE CODE", "CODE EXECUTION")):
-            return "CRITICAL"
-        if any(w in t for w in ("HIGH", "PRIVILEGE", "MEMORY CORRUPTION")):
+        explicit = guess_severity(text)
+        if explicit != "UNKNOWN":
+            return explicit
+        if re.search(r'\b(?:privilege|memory corruption)\b', t, re.I):
             return "HIGH"
-        if any(w in t for w in ("MEDIUM", "MODERATE", "DENIAL OF SERVICE", "DOS")):
+        if re.search(r'\b(?:denial of service|dos)\b', t, re.I):
             return "MEDIUM"
-        return "LOW"
+        return "UNKNOWN"
 
     @staticmethod
     def _parse(s: str):

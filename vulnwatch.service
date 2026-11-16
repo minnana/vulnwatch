@@ -5,21 +5,38 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
+User=vulnwatch
+Group=vulnwatch
 WorkingDirectory=/opt/vulnwatch
 Environment=TZ=Asia/Shanghai
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=VULNWATCH_HOST=127.0.0.1
+Environment=VULNWATCH_DATA_DIR=/var/lib/vulnwatch
 Environment=VULNWATCH_TIMEZONE=Asia/Shanghai
 Environment=VULNWATCH_DAILY_HOUR=9
 Environment=VULNWATCH_DAILY_MINUTE=0
 # 可选:把 VULNWATCH_AUTH_TOKEN 等敏感配置放到 /opt/vulnwatch/.env
 EnvironmentFile=-/opt/vulnwatch/.env
 # 必须单进程(单 worker):APScheduler 与 SQLite 都在进程内
-ExecStart=/opt/vulnwatch/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --proxy-headers
+ExecStart=/opt/vulnwatch/.venv/bin/python -m uvicorn app.main:app --host ${VULNWATCH_HOST} --port 8000 --workers 1 --no-access-log
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
+StateDirectory=vulnwatch
+StateDirectoryMode=0700
+UMask=0077
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/vulnwatch
+MemoryMax=768M
+TasksMax=128
 
 [Install]
 WantedBy=multi-user.target

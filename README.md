@@ -6,6 +6,8 @@
 
 ---
 
+> **v0.2.1**：修复手动采集后漏推送、跨天重复提醒和公告解析错误，新增持久化采集/推送状态、在线备份与回归测试。详见 [CHANGELOG.md](CHANGELOG.md)。这是公告聚合工具，产品关键词匹配不等于已确认你的资产存在漏洞。
+
 ## 一句话说清楚它是干嘛的
 
 > 你公司有 200 台电脑、6 台服务器、一堆数据库和中间件，你不可能天天自己去翻各个厂商的安全公告。**VulnWatch 替你做这件事**——每天自动搜一遍，发现新的高危漏洞就喊你。
@@ -58,8 +60,9 @@
 - 支持**标签过滤**——只看带「POC公开」「预警」等标记的，精准命中
 - **跨源去重**——同一个 CVE 从多个源抓到，只推最严重（KEV 优先）的那一条
 - **静默时段**——可设置凌晨 00:00-07:00 不打扰（按业务时区判断，不是服务器时区）
-- **首次采集不轰炸**——数据库为空时只建基线、不推送，与文档描述一致
-- **超长报告自动分条**——钉钉 2 万字节 / 企微 4096 字节限制都不会截断内容
+- **首次采集不轰炸**——每个源首次成功采集只建历史基线；采集失败不会提前建立基线
+- **持久化待推送记录**——手动采集、静默延期和发送失败的内容保留到后续每日任务；同一 CVE 跨天去重，后续升级为 KEV 可再提醒一次
+- **报告自动分条**——默认覆盖全部符合条件的记录；单条内容过长时截短展示，完整内容可在网页查看
 
 ### 3. 多渠道通知
 
@@ -75,6 +78,7 @@
 - 配置通知渠道、阈值、黑白名单、静默时段、每日推送时间（保存即生效，无需重启）
 - 手动触发「立即采集」（后台执行 + 实时进度）
 - 一键「发送测试消息」验证推送是否通
+- 查看每个源最近一次采集结果和最近推送日志，重启后仍保留
 
 ### 5. 安全加固
 
@@ -89,6 +93,8 @@
 ---
 
 ## 快速开始（本地试用，2 分钟）
+
+需要 Python 3.11+，推荐 Python 3.12。
 
 ```bash
 # 1. 创建虚拟环境（隔离依赖，避免污染系统）
@@ -115,6 +121,7 @@ python run.py
 ```bash
 pip install -r requirements-dev.txt   # 额外的测试依赖（httpx）
 python scripts/smoke_test.py
+python tests/test_reliability.py
 ```
 
 它会检查：模块导入、13 种采集器注册、全部 HTTP 接口（健康检查 / 监控源增删改查 / 漏洞列表 / 统计 / 配置读写）、批量入库幂等与 AI 摘要保留、日报分片、调度辅助函数、参数校验。退出码 `0` 表示全部通过。
@@ -143,19 +150,9 @@ docker compose logs -f vulnwatch                      # 看日志
 
 ### 方式二：systemd（开机自启 + 长期运行）
 
-```bash
-cd /opt/vulnwatch
-sudo apt install -y python3 python3-venv python3-pip
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+请按 [DEPLOY.md](DEPLOY.md) 的 systemd 步骤部署：使用专用 `vulnwatch` 用户、`/opt/vulnwatch/.venv` 虚拟环境和 `/var/lib/vulnwatch` 数据目录。访问口令放在权限为 `600` 的 `.env` 中。
 
-# 敏感配置（访问口令等）放 .env，service 已配置 EnvironmentFile
-echo "VULNWATCH_AUTH_TOKEN=$(openssl rand -hex 16)" | sudo tee /opt/vulnwatch/.env
-
-sudo cp vulnwatch.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now vulnwatch
-```
+服务默认只监听 `127.0.0.1:8000`。直接供局域网访问时，在 `.env` 设置 `VULNWATCH_HOST=服务器内网IP`；使用反向代理时保留默认值。旧版升级需先迁移数据目录，不能只替换服务文件。
 
 ---
 
@@ -238,28 +235,28 @@ nginx, redis, 群晖, VMware, mysql
 | 事项 | 操作 |
 |------|------|
 | 看有没有采集失败的源 | 网页「监控源」页，点「采集」单独重试 |
-| 备份数据库 | 复制 `data/` 目录即可（见下方命令） |
-| 更新系统 | `git pull` + `pip install -r requirements.txt` + 重启 |
+| 备份数据库 | 使用 SQLite 在线备份脚本（见下方命令） |
+| 更新系统 | 先备份，再按 [DEPLOY.md](DEPLOY.md) 更新依赖并重启 |
 
 ### 备份与恢复
 
 ```bash
-# 备份（数据库就是 data/ 目录里的一个文件）
-tar -czf vulnwatch-backup-$(date +%F).tar.gz data/
+# systemd：在线备份并校验完整性
+sudo /opt/vulnwatch/.venv/bin/python /opt/vulnwatch/scripts/backup.py
 
-# 恢复（解压回去即可）
-tar -xzf vulnwatch-backup-2026-11-11.tar.gz
+# 本地运行：指定数据库和输出目录
+python scripts/backup.py --database data/vulnwatch.db --directory backups
 ```
 
-> SQLite 已开启 WAL 模式，运行中直接复制 `data/` 目录也能拿到一致快照；更稳妥的做法是先停服务。
+SQLite 的 WAL 模式不能保证直接复制运行中的数据库得到一致备份。请使用上面的脚本；恢复需先停止服务，具体步骤见 [DEPLOY.md](DEPLOY.md)。数据库和备份包含通知凭证，应限制访问。
 
 ### 常见问题
 
 **Q: 某个源一直采集到 0 条？**
-A: 大概率是那款产品近期真没新漏洞，或关键词太窄。去「监控源」页调关键词后点「采集」单独重试。
+A: 先检查最近采集状态。成功但为 0 可能是近期无匹配记录；也可能是网站结构或筛选条件变化。失败时查看错误，不要把 HTTP 403 等错误当成没有漏洞。
 
 **Q: 首次部署推了一大堆历史漏洞？**
-A: 不会。数据库为空时首轮采集只建立历史基线、不推送，之后每天**只推新增**的漏洞。
+A: 每个源首次成功采集只建立历史基线、不推送；之后符合条件且尚未成功推送的记录会进入每日任务。升级到 v0.2.1 后，各源首次成功采集也会重新建立基线。
 
 **Q: 想改每天推送的时间？**
 A: 直接去「配置」→「定时任务」改每天时间，保存即生效；也可以用环境变量 `VULNWATCH_DAILY_HOUR` / `VULNWATCH_DAILY_MINUTE`（仅当数据库里没有 `daily_time` 时生效）。
@@ -341,7 +338,7 @@ A: 默认并行 8 个源 + NVD 批量模式，正常 10~60 秒。慢网环境把
 
 ## 技术栈
 
-- **后端**：Python 3.10+ / FastAPI / SQLAlchemy / SQLite
+- **后端**：Python 3.11+（推荐 3.12）/ FastAPI / SQLAlchemy / SQLite
 - **任务调度**：APScheduler（进程内单实例）
 - **前端**：原生 HTML/JS 单页（无框架，轻量）
 - **通知**：钉钉 / 企微 / 飞书 / Server酱 / PushPlus

@@ -109,10 +109,10 @@
     <!-- 概览 -->
     <div class="page active" id="page-dashboard">
       <h1>漏洞情报概览</h1>
-      <p class="subtitle">系统自动采集官方安全公告,重要漏洞高亮并推送</p>
+      <p class="subtitle">聚合公开漏洞情报并推送重要更新；记录数含不同来源，不代表公司已确认受影响的设备数量。</p>
       <div class="card">
         <div class="grid-2" style="grid-template-columns:repeat(4,1fr)">
-          <div class="stat-box"><div class="num" id="stat-total" style="color:var(--primary)">-</div><div class="label">漏洞总数(近7天)</div></div>
+          <div class="stat-box"><div class="num" id="stat-total" style="color:var(--primary)">-</div><div class="label">情报记录(近7天收录/发布)</div></div>
           <div class="stat-box"><div class="num" id="stat-critical" style="color:var(--red)">-</div><div class="label">严重</div></div>
           <div class="stat-box"><div class="num" id="stat-high" style="color:var(--orange)">-</div><div class="label">高危</div></div>
           <div class="stat-box"><div class="num" id="stat-kev" style="color:var(--red)">-</div><div class="label">在野利用(KEV)</div></div>
@@ -124,6 +124,10 @@
           <span class="hint">手动触发一次全量采集(后台运行,可离开本页)</span>
         </div>
         <div id="collect-result" class="hint"></div>
+      </div>
+      <div class="card">
+        <h2>最近推送记录</h2>
+        <div id="alert-history" class="hint">加载中…</div>
       </div>
     </div>
 
@@ -168,7 +172,7 @@
         </div>
         <table>
           <thead><tr>
-            <th>名称</th><th>类别</th><th>类型</th><th>CPE / 关键词</th><th>状态</th><th>操作</th>
+            <th>名称</th><th>类别</th><th>类型</th><th>CPE / 关键词</th><th>状态 / 最近采集</th><th>操作</th>
           </tr></thead>
           <tbody id="source-tbody"></tbody>
         </table>
@@ -231,12 +235,12 @@
           </select>
           <div class="hint">选择推送用哪个通道,各通道凭证独立配置</div>
         </div>
-        <div class="form-row"><label>钉钉 Webhook</label><input id="set-webhook" style="width:100%" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..."></div>
-        <div class="form-row"><label>钉钉加签密钥(Secret)</label><input id="set-secret" style="width:100%" placeholder="SEC..."></div>
-        <div class="form-row"><label>企业微信 Webhook</label><input id="set-wecom-webhook" style="width:100%" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."></div>
-        <div class="form-row"><label>飞书 Webhook</label><input id="set-feishu-webhook" style="width:100%" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."></div>
-        <div class="form-row"><label>Server酱 SendKey</label><input id="set-serverchan-sendkey" style="width:100%" placeholder="SCT..."></div>
-        <div class="form-row"><label>PushPlus Token</label><input id="set-pushplus-token" style="width:100%" placeholder="你的 token"></div>
+        <div class="form-row"><label>钉钉 Webhook</label><input type="password" autocomplete="off" id="set-webhook" style="width:100%" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..."></div>
+        <div class="form-row"><label>钉钉加签密钥(Secret)</label><input type="password" autocomplete="off" id="set-secret" style="width:100%" placeholder="SEC..."></div>
+        <div class="form-row"><label>企业微信 Webhook</label><input type="password" autocomplete="off" id="set-wecom-webhook" style="width:100%" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."></div>
+        <div class="form-row"><label>飞书 Webhook</label><input type="password" autocomplete="off" id="set-feishu-webhook" style="width:100%" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."></div>
+        <div class="form-row"><label>Server酱 SendKey</label><input type="password" autocomplete="off" id="set-serverchan-sendkey" style="width:100%" placeholder="SCT..."></div>
+        <div class="form-row"><label>PushPlus Token</label><input type="password" autocomplete="off" id="set-pushplus-token" style="width:100%" placeholder="你的 token"></div>
         <button class="btn" onclick="saveSettings()">保存通知配置</button>
         <button class="btn secondary" onclick="testNotify()">发送测试消息</button>
         <span id="test-result" class="hint"></span>
@@ -282,7 +286,7 @@
       </div>
       <div class="card">
         <h2>🤖 DeepSeek(可选增强)</h2>
-        <div class="form-row"><label>API Key</label><input id="set-ds-key" style="width:100%" placeholder="sk-..."></div>
+        <div class="form-row"><label>API Key</label><input type="password" autocomplete="off" id="set-ds-key" style="width:100%" placeholder="sk-..."></div>
         <div class="hint">填入后,每日推送里排名靠前的漏洞会自动生成中文摘要;留空则跳过,不影响主链路</div>
       </div>
       <div class="card">
@@ -339,7 +343,8 @@ async function promptToken() {
 }
 
 // 统一请求封装:非 2xx 抛错(便于统一 toast),401 时提示口令后重试一次
-async function api(method, url, body) {
+async function api(method, url, body, retried = false) {
+  const attemptedToken = getToken();
   const headers = Object.assign(
     body !== undefined ? { 'Content-Type': 'application/json' } : {},
     authHeaders()
@@ -350,8 +355,10 @@ async function api(method, url, body) {
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   if (resp.status === 401) {
+    if (retried) throw new Error('未授权:访问口令错误');
+    if (getToken() && getToken() !== attemptedToken) return api(method, url, body, true);
     localStorage.removeItem('vulnwatch_token');
-    if (await promptToken()) return api(method, url, body);
+    if (await promptToken()) return api(method, url, body, true);
     throw new Error('未授权:口令缺失或错误');
   }
   let data = null;
@@ -411,6 +418,11 @@ async function loadDashboard() {
     document.getElementById('stat-critical').textContent = d.critical;
     document.getElementById('stat-high').textContent = d.high;
     document.getElementById('stat-kev').textContent = d.kev;
+    const alerts = await get('/api/alerts?limit=10');
+    const names = {success:'发送成功',failed:'失败',baseline:'建立基线',skipped:'无待推送内容',silent:'静默延期'};
+    document.getElementById('alert-history').innerHTML = alerts.length ? alerts.map(a =>
+      `<div class="collect-line">${esc((a.triggered_at || '').replace('T',' ').slice(0,19))} UTC · ${esc(names[a.status] || a.status)} · ${esc(a.detail || '')}</div>`
+    ).join('') : '暂无推送记录；新数据将在每日汇总时处理。';
   } catch (e) {
     toast('加载概览失败: ' + e.message);
   }
@@ -448,7 +460,9 @@ async function loadVulns() {
 // ---------- 监控源 ----------
 async function loadSources() {
   let d;
-  try { d = await get('/api/sources'); } catch (e) { toast('加载监控源失败: ' + e.message); return; }
+  let history;
+  try { [d, history] = await Promise.all([get('/api/sources'), get('/api/collection-history')]); } catch (e) { toast('加载监控源失败: ' + e.message); return; }
+  const states = Object.fromEntries(history.map(s => [s.source_id, s]));
   const tbody = document.getElementById('source-tbody');
   tbody.innerHTML = d.map(s => `
     <tr>
@@ -456,7 +470,7 @@ async function loadSources() {
       <td>${esc(s.category)}</td>
       <td><span class="badge unknown">${esc(s.source_type)}</span></td>
       <td style="font-size:12px;color:var(--muted)">${esc(s.cpe || s.keyword || '-')}</td>
-      <td>${s.enabled ? '<span class="badge low">启用</span>' : '<span class="badge unknown">停用</span>'}</td>
+      <td>${s.enabled ? '<span class="badge low">启用</span>' : '<span class="badge unknown">停用</span>'}<br><span class="hint">${states[s.id] ? (states[s.id].error ? '⚠️ ' + esc(states[s.id].error) : '最近获取 ' + states[s.id].fetched + ' 条') : '尚未采集'}</span></td>
       <td>
         <button class="btn small secondary" onclick="collectOne(${s.id})">采集</button>
         <button class="btn small secondary" onclick="editSource(${s.id})">编辑</button>

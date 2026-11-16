@@ -1,10 +1,10 @@
-# VulnWatch 运行依赖(Python 3.10+)
-fastapi==0.115.5
-uvicorn[standard]==0.32.1
-sqlalchemy==2.0.36
-pydantic==2.10.3
-requests==2.32.3
-feedparser==6.0.11
-apscheduler==3.10.4
-# Windows / slim 镜像缺少系统时区库时,zoneinfo 需要 tzdata
-tzdata==2024.2
+# Production dependencies verified on Python 3.12 (Python >=3.11).
+fastapi==0.163.1
+starlette==1.10.0
+uvicorn[standard]==0.54.0
+sqlalchemy==2.0.57
+pydantic==2.14.3
+requests==2.34.2
+feedparser==6.0.14
+apscheduler==3.11.3
+tzdata==2026.6

@@ -1,203 +1,147 @@
-# VulnWatch 部署指南(Ubuntu 服务器)
+# VulnWatch 部署与维护
 
-本文档面向你提供的 Ubuntu 服务器,提供两种部署方式:**Docker**(推荐)和 **systemd + 虚拟环境**。
+推荐 Ubuntu 24.04。原生部署需要 Python 3.11+，已验证 Python 3.12；较旧系统可使用 Docker。需要能访问 NVD、CISA 和各公告源。
 
----
+只能运行一个应用进程、一个 worker 和一个副本，避免内置调度器重复推送。以下为两种独立部署方式，选择一种即可。
 
-## 一、环境要求
+## Docker
 
-- Ubuntu 20.04 / 22.04 / 24.04
-- Python 3.10+(仅 systemd 方式需要)
-- 可访问外网(采集器需访问 NVD、CISA、各厂商官网)
-- 防火墙放行 8000 端口(或由 Nginx 反向代理)
-
----
-
-## 二、方式一:Docker 部署(推荐)
-
-### 1. 上传代码到服务器
+先安装 Docker Engine 和 Compose，然后获取源码：
 
 ```bash
-# 把整个项目目录上传到服务器,例如 /opt/vulnwatch
-scp -r 项目目录 ubuntu@服务器IP:/opt/vulnwatch
-```
-
-### 2. 安装 Docker(如已安装可跳过)
-
-```bash
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
-# 重新登录使权限生效
-```
-
-### 3. 构建并启动
-
-```bash
+sudo git clone https://github.com/minnana/vulnwatch.git /opt/vulnwatch
 cd /opt/vulnwatch
-docker compose up -d --build
+sudo install -m 600 .env.example .env
+openssl rand -hex 24
+sudoedit .env
 ```
 
-### 4. 查看日志
+将生成的随机口令填入 `.env` 的 `VULNWATCH_AUTH_TOKEN`。Compose 默认映射主机的 `8000` 端口；只允许受信任网络访问。反向代理场景可将端口映射改为 `127.0.0.1:8000:8000`。
 
 ```bash
-docker compose logs -f vulnwatch
+sudo docker compose up -d --build
+sudo docker compose ps
+sudo docker compose logs --tail 100 vulnwatch
 ```
 
-### 5. 访问
+打开 `http://服务器IP:8000` 并输入口令。数据库持久化在宿主机 `/opt/vulnwatch/data`。Compose 只传递 `docker-compose.yml` 中声明的环境变量；更多参数需要添加到该文件的 `environment` 中。
 
-浏览器打开 `http://服务器IP:8000`
+## systemd（Ubuntu 24.04）
 
----
-
-## 三、方式二:systemd + 虚拟环境
-
-### 1. 上传代码
+### 安装代码与专用用户
 
 ```bash
-sudo mkdir -p /opt/vulnwatch
-sudo chown $USER:$USER /opt/vulnwatch
-# 上传代码到 /opt/vulnwatch
-```
-
-### 2. 安装依赖
-
-```bash
-cd /opt/vulnwatch
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+sudo apt install -y git python3 python3-venv openssl
+sudo git clone https://github.com/minnana/vulnwatch.git /opt/vulnwatch
+sudo python3 -m venv /opt/vulnwatch/.venv
+sudo /opt/vulnwatch/.venv/bin/pip install -r /opt/vulnwatch/requirements.txt
+
+id vulnwatch >/dev/null 2>&1 || sudo useradd --system --user-group --home-dir /var/lib/vulnwatch --shell /usr/sbin/nologin vulnwatch
+sudo install -d -o vulnwatch -g vulnwatch -m 700 /var/lib/vulnwatch
+sudo install -m 600 /opt/vulnwatch/.env.example /opt/vulnwatch/.env
+openssl rand -hex 24
+sudoedit /opt/vulnwatch/.env
 ```
 
-### 3. 注册 systemd 服务
+在 `.env` 设置生成的访问口令。服务默认监听 `127.0.0.1:8000`；需要局域网直连时添加 `VULNWATCH_HOST=服务器内网IP`，使用实际 IP。默认数据目录为 `/var/lib/vulnwatch`，不要使用 Docker 的 `/app/data`。
+
+源码和虚拟环境由 root 持有，服务以 `vulnwatch` 用户运行，只允许写入数据目录。`.env` 由 systemd 读取，无需向服务用户开放文件读取权限。
+
+### 启动并验证
 
 ```bash
-sudo cp vulnwatch.service /etc/systemd/system/
+sudo install -m 644 /opt/vulnwatch/vulnwatch.service /etc/systemd/system/vulnwatch.service
 sudo systemctl daemon-reload
-sudo systemctl enable vulnwatch
+sudo systemctl enable --now vulnwatch
+sudo systemctl status vulnwatch --no-pager
+sudo journalctl -u vulnwatch -n 100 --no-pager
+curl -fsS http://127.0.0.1:8000/api/health
+```
+
+若设置了特定内网监听 IP，健康检查 URL 也改用该 IP。健康接口正常返回 HTTP 200，数据库异常返回 503。网页外壳公开，设置口令后的数据接口要求认证。对外访问请使用 HTTPS 反向代理。
+
+## 配置与验收
+
+1. 在「配置」填写通知渠道的 Webhook 和加签密钥，保存后发送一条测试消息。
+2. 设置推送阈值、产品关键词和每日汇总时间，默认 `09:00 / Asia/Shanghai`。网页修改立即生效，重启后保留。
+3. 点击「立即采集」，核对每个源的最近采集结果。每个源首次成功采集只建立历史基线，不推送历史内容。
+4. 后续手动采集得到的新记录会保留到每日任务；发送失败或静默延期的内容也会继续保留。
+5. 查看最近推送日志；没有符合条件的新内容时不会发送空日报。
+
+内置 28 个源，启用状态可在网页调整。AVD / 启明星辰默认关闭，需额外浏览器依赖。遇到 HTTP 403、限流或页面变化时先停用或修复对应源，不能把失败理解为没有漏洞。成功返回 0 条仍应结合来源页面核对。
+
+KEV 绕过严重级别阈值，但仍受产品关键词和标签筛选约束。DeepSeek 摘要为可选功能，未配置 API Key 不影响采集和通知。
+
+## 备份与恢复
+
+### 在线备份
+
+脚本使用 SQLite Backup API 生成一致快照，并执行 `integrity_check`。不要直接复制运行中的 `.db` 文件来替代在线备份。
+
+```bash
+# systemd：输出到 /var/backups/vulnwatch
+sudo /opt/vulnwatch/.venv/bin/python /opt/vulnwatch/scripts/backup.py
+
+# Docker：输出到挂载的数据目录，宿主机对应 data/backups
+sudo docker compose exec -T vulnwatch python scripts/backup.py --database /app/data/vulnwatch.db --directory /app/data/backups
+```
+
+数据库含通知凭证和可选 API Key，备份文件同样敏感。备份目录权限为 `700`，文件为 `600`。脚本不会自动排程或清理旧备份；另行配置备份周期和保留策略。
+
+### systemd 恢复
+
+先选定并核对备份路径，停止服务后保留原数据目录，再恢复备份；不要将旧 WAL 文件与新数据库混用：
+
+```bash
+sudo systemctl stop vulnwatch
+sudo mv /var/lib/vulnwatch "/var/lib/vulnwatch.before-restore-$(date +%Y%m%dT%H%M%S)"
+sudo install -d -o vulnwatch -g vulnwatch -m 700 /var/lib/vulnwatch
+# 将下方路径替换为实际的备份文件
+sudo install -o vulnwatch -g vulnwatch -m 600 /var/backups/vulnwatch/选定备份.db /var/lib/vulnwatch/vulnwatch.db
 sudo systemctl start vulnwatch
+sudo systemctl status vulnwatch --no-pager
 ```
 
-### 4. 查看状态
+Docker 恢复同样先 `docker compose down`，保留原 `data/` 目录，将选定备份安装为新目录的 `data/vulnwatch.db`，再启动。确保容器运行用户能读写新目录；不要删除原目录直到恢复验证完成。
+
+## 旧版升级到 0.2.1
+
+### systemd 数据迁移
+
+旧版可能使用 `/opt/vulnwatch/venv` 和 `/opt/vulnwatch/data`，新服务使用 `.venv` 和 `/var/lib/vulnwatch`。先停止旧服务并备份旧数据库，再替换服务配置；不要直接启动指向空目录的新服务。
+
+1. `sudo systemctl stop vulnwatch`，确认旧服务已停止。
+2. 记录当前提交：`sudo git -C /opt/vulnwatch rev-parse HEAD`，另行保存旧 `.env` 和服务文件。
+3. 保留一份旧数据目录备份；服务停止后再复制整个目录，包含存在的 WAL/SHM 文件。
+4. `sudo git -C /opt/vulnwatch pull --ff-only`；如有本地修改或分叉，先核对合并，不要强制覆盖。
+5. 按上方安装步骤创建专用用户、数据目录和 `.venv`，安装当前依赖。不要重新覆盖已有 `.env`。
+6. 用备份脚本导出旧数据库到新目录，再设置所有权：
 
 ```bash
-sudo systemctl status vulnwatch
-sudo journalctl -u vulnwatch -f
+sudo /opt/vulnwatch/.venv/bin/python /opt/vulnwatch/scripts/backup.py --database /opt/vulnwatch/data/vulnwatch.db --directory /var/backups/vulnwatch
+# 使用脚本实际输出的文件路径
+sudo install -o vulnwatch -g vulnwatch -m 600 /var/backups/vulnwatch/实际备份.db /var/lib/vulnwatch/vulnwatch.db
 ```
 
----
+7. 修改已有 `.env`：移除旧 `VULNWATCH_DB` / `VULNWATCH_DATA_DIR`，或指向 `/var/lib/vulnwatch` 下的数据库；核对访问口令和监听 IP。
+8. 安装新服务文件，执行 `daemon-reload`、启动服务，核对原配置、漏洞数量和健康接口。
 
-## 四、配置(两种方式通用)
+首次启动自动新建回执与源状态表，保留原配置和漏洞。升级后每个源首次成功采集会重新建立基线，这轮历史内容不会推送。
 
-### 1. 钉钉机器人配置
+已经使用本版目录结构时，先在线备份，再停止服务、`git pull --ff-only`、安装 `requirements.txt`、同步服务文件并重启即可。回退时配合升级前的数据库备份及服务配置。
 
-1. 打开钉钉群 → 右上角「群设置」→「智能群助手」→「添加机器人」→「自定义机器人」
-2. 安全设置选择 **「加签」**,记下生成的 **Webhook 地址** 和 **加签密钥(Secret)**
-3. 登录 VulnWatch Web 界面 → 「配置」→ 填入 Webhook 和 Secret → 保存 → 点「发送测试消息」验证
+### Docker 更新
 
-> 钉钉机器人「加签」方式无需配置关键词,是最稳妥的安全设置。
+先执行在线备份，记录旧提交，再运行 `docker compose down`、`git pull --ff-only`、`docker compose up -d --build`。保留原 `data/` 挂载目录。首次采集基线规则与 systemd 一致。
 
-### 2. 告警阈值
-
-在「配置」页设置推送阈值,默认「高危及以上」。
-- 仅严重 / 高危及以上 / 中危及以上 / 全部
-- **在野利用漏洞(CISA KEV)无论阈值如何,始终推送**
-
-### 3. DeepSeek(可选)
-
-在「配置」页填入 DeepSeek API Key。填入后系统可对重要漏洞生成中文摘要。
-不填则跳过,主链路(采集 + 告警 + 推送)完全不受影响。
-
-### 4. 每日汇总时间
-
-通过环境变量设置(默认每天 09:00):
+## 离线验证
 
 ```bash
-# Docker: 修改 docker-compose.yml 中的环境变量
-VULNWATCH_DAILY_HOUR=9
-VULNWATCH_DAILY_MINUTE=0
-
-# systemd: 修改 vulnwatch.service 中的 Environment
+python -m pip install -r requirements-dev.txt
+python scripts/smoke_test.py
+python tests/test_reliability.py
+python -m pip check
 ```
 
-### 5. 访问认证(强烈建议上生产前开启)
-
-系统默认**匿名可访问**,适合内网 demo。**部署到公网或多人环境前,务必设置访问口令**:
-
-```bash
-# Docker: 在 docker-compose.yml 的 environment 中添加
-VULNWATCH_AUTH_TOKEN=你的随机口令
-
-# systemd: 在 vulnwatch.service 的 Environment 中添加
-Environment=VULNWATCH_AUTH_TOKEN=你的随机口令
-```
-
-设置后,访问 Web 界面会被提示输入口令;也可通过 `?token=口令` 或 `Authorization: Bearer 口令` 访问 API。
-
-> 口令请用足够强的随机串,例如 `openssl rand -hex 16`。
-
----
-
-## 五、Nginx 反向代理(可选,便于加 HTTPS 或改端口)
-
-```nginx
-server {
-    listen 80;
-    server_name vulnwatch.example.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
-}
-```
-
----
-
-## 六、监控源管理
-
-系统内置 20 个默认监控源,可在 Web 界面「监控源」页增删改:
-
-| 类型 | 说明 | 适用 |
-|------|------|------|
-| NVD 关键词/CPE | 按产品名关键词搜索 NVD | 通用产品(数据库、运行时等) |
-| RSS / Atom | 解析 RSS feed | MSRC 等有 RSS 的厂商 |
-| HTML 公告页 | 正则解析公告页 | Synology、nginx 等静态公告页 |
-| Go 官方漏洞库 | OSV 格式 | Go 标准库/工具链 |
-| CISA KEV | 在野利用目录 | 必配 |
-
-**新增监控源**只需填:名称 + 类别 + 类型 + URL(+ 关键词或 CPE)。
-
----
-
-## 七、数据存储
-
-- 数据库:SQLite,位于 `data/vulnwatch.db`
-- 备份:直接复制 `data/` 目录即可
-
-```bash
-# 备份
-tar -czf vulnwatch-backup-$(date +%F).tar.gz data/
-
-# 恢复
-tar -xzf vulnwatch-backup-2026-11-10.tar.gz
-```
-
----
-
-## 八、常见问题
-
-**Q: 首次部署时推送了大量历史漏洞?**
-A: 首次采集会建立历史基线,部分公告页(如 nginx)会收录全部历史 CVE。这是正常现象,后续每日只会推送**新增**的漏洞。
-
-**Q: 某些源采集到 0 条?**
-A: 可能该产品近期无新漏洞,或关键词不准确。可在「监控源」页调整关键词后点「采集」单源重试。
-
-**Q: NVD 采集有频率限制?**
-A: 系统内置了按域名的请求间隔限速(默认 1 秒,NVD 单独 6 秒),避免触发限流。可在环境变量 `VULNWATCH_REQUEST_INTERVAL` 调整。
-
-**Q: 如何只监控我关心的产品?**
-A: 在「监控源」页停用不需要的源,或新增自定义源。
+测试使用独立临时数据库，不向实际机器人发送消息。`requirements.lock.txt` 是 Ubuntu / Python 3.12 验证环境的完整依赖快照（含测试依赖和 Linux 的 uvloop），其他平台使用 `requirements.txt`。

@@ -32,7 +32,7 @@ from .scheduler import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("vulnwatch")
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 # 访问认证口令:通过环境变量 VULNWATCH_AUTH_TOKEN 设置。
@@ -383,8 +383,13 @@ def api_collect_one(source_id: int, db: Session = Depends(get_db)):
     s = crud.get_source(db, source_id)
     if not s:
         raise HTTPException(404, "监控源不存在")
-    r = collect_source(db, s)
-    return _public_result(r)
+    if not begin_collection(blocking=False):
+        raise HTTPException(409, "已有采集任务正在运行,请稍后再试")
+    try:
+        r = collect_source(db, s)
+        return _public_result(r)
+    finally:
+        end_collection()
 
 
 # ---------- 通知测试 ----------
@@ -399,6 +404,10 @@ def _do_test_notify(db: Session, channel: Optional[str] = None) -> dict:
     if not credential:
         return {"ok": False, "channel": channel, "msg": f"未配置 {channel} 的凭证({cred_key})"}
     ok = send(channel, credential, secret, "VulnWatch 测试", "这是一条来自 VulnWatch 的测试消息 ✅")
+    db.add(models.AlertLog(severity="TEST", count=0,
+                           status="success" if ok else "failed",
+                           detail=f"通知通道连通性测试: {channel}"))
+    db.commit()
     return {"ok": ok, "channel": channel}
 
 
@@ -430,13 +439,29 @@ def api_health():
     except Exception as e:
         db_ok = False
         logger.warning("健康检查数据库异常: %s", e)
-    return {
+    payload = {
         "status": "ok" if db_ok else "degraded",
         "version": APP_VERSION,
         "time": config.now_local().isoformat(),
         "database": "ok" if db_ok else "error",
         "collecting": is_collecting(),
     }
+    return JSONResponse(payload, status_code=200 if db_ok else 503)
+
+
+@app.get("/api/collection-history")
+def api_collection_history(db: Session = Depends(get_db)):
+    return [{"source_id": s.source_id, "first_success_at": s.first_success_at,
+             "last_attempt_at": s.last_attempt_at, "fetched": s.fetched,
+             "new_count": s.new_count, "error": s.error}
+            for s in db.query(models.SourceCollectionState).all()]
+
+
+@app.get("/api/alerts")
+def api_alerts(limit: int = Query(50, ge=1, le=200), db: Session = Depends(get_db)):
+    return [{"id": r.id, "triggered_at": r.triggered_at, "status": r.status,
+             "count": r.count, "detail": r.detail}
+            for r in db.query(models.AlertLog).order_by(models.AlertLog.id.desc()).limit(limit)]
 
 
 # ---------- 静态页面 ----------

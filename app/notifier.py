@@ -137,7 +137,8 @@ def send(channel: str, credential: str, secret: str, title: str, text: str) -> b
     try:
         return bool(fn(credential, secret, title, text))
     except Exception as e:
-        logger.warning("推送异常(%s): %s", channel, e)
+        # Request exception messages can contain the full signed webhook URL.
+        logger.warning("推送异常(%s): %s", channel, type(e).__name__)
         return False
 
 
@@ -202,62 +203,45 @@ def _chunk_text(text: str, max_bytes: int) -> List[str]:
     return parts
 
 
-def build_report_messages(
-    vulns: Iterable,
-    threshold_severity: str = "HIGH",
-    max_items: int = 50,
-) -> List[str]:
-    """生成日报(自动分片),返回若干条可直接发送的 markdown 文本。"""
-    items = list(vulns or [])[:max_items]
+def build_report_batches(vulns, threshold_severity="HIGH", max_items=None):
+    """Keep each record in one message so successful chunks can be acknowledged."""
+    items = sorted(list(vulns or []), key=lambda v: (
+        0 if _field(v, "is_kev") else 1,
+        _RANK.get((_field(v, "severity") or "UNKNOWN").upper(), 4),
+        -(_field(v, "cvss_score") or 0),
+    ))
+    if max_items is not None:
+        items = items[:max_items]
+    if not items:
+        return []
+    budget = max(256, config.PUSH_MAX_BYTES - 600)
+    groups, blocks, records, size = [], [], [], 0
+    for v in items:
+        label = "🚨 在野利用" if _field(v, "is_kev") else str(_field(v, "severity") or "UNKNOWN")
+        block = "### " + label + chr(10) + chr(10).join(_render_item(v))
+        encoded = block.encode("utf-8")
+        if len(encoded) > budget:
+            block = encoded[:budget - 3].decode("utf-8", errors="ignore") + "…"
+        block_size = len(block.encode("utf-8")) + 2
+        if blocks and size + block_size > budget:
+            groups.append((blocks, records))
+            blocks, records, size = [], [], 0
+        blocks.append(block)
+        records.append(v)
+        size += block_size
+    if blocks:
+        groups.append((blocks, records))
     now = config.now_local().strftime("%Y-%m-%d %H:%M")
+    result = []
+    for idx, (blocks, records) in enumerate(groups, 1):
+        header = (f"## 🔒 每日漏洞情报汇总 (第 {idx}/{len(groups)} 部分)" + chr(10)
+                  + f"共 {len(items)} 条需要关注 (阈值 {threshold_severity.upper()}) · {now}")
+        result.append((header + chr(10)*2 + (chr(10)*2).join(blocks), records))
+    return result
 
-    ordered = sorted(
-        items,
-        key=lambda v: (
-            0 if _field(v, "is_kev") else 1,
-            _RANK.get((_field(v, "severity") or "UNKNOWN").upper(), 4),
-            -(_field(v, "cvss_score") or 0),
-        ),
-    )
-    kev = [v for v in ordered if _field(v, "is_kev")]
-    normal = [v for v in ordered if not _field(v, "is_kev")]
 
-    sections: List[str] = []
-    if kev:
-        lines = [f"### 🚨 在野利用(需立即处理,共 {len(kev)} 条)"]
-        for v in kev:
-            lines.extend(_render_item(v))
-        sections.append("\n".join(lines))
-    for level, label in _LEVEL_SECTIONS:
-        group = [v for v in normal if (_field(v, "severity") or "").upper() == level]
-        if not group:
-            continue
-        lines = [f"### {label}(共 {len(group)} 条)"]
-        for v in group:
-            lines.extend(_render_item(v))
-        sections.append("\n".join(lines))
-    if not sections:
-        sections.append("本次没有需要推送的漏洞。")
-
-    footer = ""
-    total_items = len(items)
-    if total_items >= max_items:
-        footer = f"\n\n仅展示前 {max_items} 条,完整列表请查看 Web 管理界面"
-    body = "\n\n".join(sections) + footer
-
-    # 预留标题(~500 字节)后分片
-    budget = max(1000, config.PUSH_MAX_BYTES - 600)
-    parts = _chunk_text(body, budget)
-    total = len(parts)
-    messages: List[str] = []
-    for idx, part in enumerate(parts, 1):
-        suffix = f"(第 {idx}/{total} 部分)" if total > 1 else ""
-        header = (
-            f"## 🔒 每日漏洞情报汇总{suffix}\n"
-            f"共 {total_items} 条需要关注 (阈值 {threshold_severity.upper()}) · {now}"
-        )
-        messages.append(f"{header}\n\n{part}")
-    return messages
+def build_report_messages(vulns: Iterable, threshold_severity="HIGH", max_items=None) -> List[str]:
+    return [text for text, _ in build_report_batches(vulns, threshold_severity, max_items)]
 
 
 def build_report(vulns, threshold_severity: str = "HIGH", max_items: int = 50) -> str:

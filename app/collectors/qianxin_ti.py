@@ -25,6 +25,8 @@ class QianxinTiCollector(BaseCollector):
         if resp.status_code != 200:
             return []
         data = resp.json()
+        if not isinstance(data.get("data"), dict) or not isinstance(data["data"].get("key_vuln_add"), list):
+            raise RuntimeError("奇安信接口结构变化或访问受限")
         key_vulns = data.get("data", {}).get("key_vuln_add", [])
         results = []
         seen = set()

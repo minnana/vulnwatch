@@ -69,3 +69,24 @@ class AlertLog(Base):
     count = Column(Integer, default=0)
     status = Column(String(20), default="success")  # success / failed / skipped / silent / baseline
     detail = Column(Text, nullable=True)
+
+
+class SourceCollectionState(Base):
+    """Persistent per-source baseline and last collection result."""
+    __tablename__ = "source_collection_states"
+
+    source_id = Column(Integer, ForeignKey("monitor_sources.id", ondelete="CASCADE"), primary_key=True)
+    first_success_at = Column(DateTime, nullable=True)
+    last_attempt_at = Column(DateTime, nullable=False)
+    fetched = Column(Integer, default=0)
+    new_count = Column(Integer, default=0)
+    error = Column(Text, nullable=True)
+
+
+class NotificationReceipt(Base):
+    """Only baseline/successful deliveries are acknowledged; failures remain pending."""
+    __tablename__ = "notification_receipts"
+
+    event_key = Column(String(300), primary_key=True)
+    status = Column(String(20), nullable=False)
+    recorded_at = Column(DateTime, default=config.utcnow, nullable=False)

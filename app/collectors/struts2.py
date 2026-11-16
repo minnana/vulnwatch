@@ -33,12 +33,11 @@ class Struts2Collector(BaseCollector):
                 continue
             seen.add(s2id)
             results.append({"href": href, "s2id": s2id})
-            if len(results) >= 20:
-                break
+        results.sort(key=lambda r: int(r["s2id"].split("-")[1]), reverse=True)
 
         # 逐个详情页解析严重性
         vulns = []
-        for r in results[-10:]:  # 最近 10 条
+        for r in results[:10]:  # 最近 10 条，不依赖页面链接排列顺序
             detail = self._parse_detail(r["href"], r["s2id"])
             if detail:
                 vulns.append(detail)

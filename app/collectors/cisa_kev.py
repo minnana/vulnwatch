@@ -16,6 +16,8 @@ class CisaKevCollector(BaseCollector):
         if resp.status_code != 200:
             return []
         data = resp.json()
+        if not isinstance(data.get("vulnerabilities"), list):
+            raise RuntimeError("CISA KEV 响应结构异常")
         results = []
         for item in data.get("vulnerabilities", []):
             results.append(self._normalize(item))

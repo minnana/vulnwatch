@@ -17,6 +17,11 @@ data/
 # 本地配置/密钥
 .env
 
+# 本机部署记录与运行截图（不包含在公共源码中）
+DEPLOYMENT-*.md
+docs/deployment-*.jpg
+docs/publish-*.jpg
+
 # 工具与系统文件
 .workbuddy/
 .DS_Store

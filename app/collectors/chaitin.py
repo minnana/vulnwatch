@@ -31,6 +31,8 @@ class ChaitinCollector(BaseCollector):
             if resp.status_code != 200:
                 break
             data = resp.json()
+            if not isinstance(data.get("data"), dict) or not isinstance(data["data"].get("list"), list):
+                raise RuntimeError("长亭接口结构变化或访问受限")
             items = data.get("data", {}).get("list", [])
             if not items:
                 break

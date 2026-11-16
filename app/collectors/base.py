@@ -81,9 +81,11 @@ class BaseCollector:
         last_exc = None
         for attempt in range(RETRY_TIMES + 1):
             try:
-                return get_session().request(
+                response = get_session().request(
                     method, url, headers=headers, timeout=config.REQUEST_TIMEOUT, **kwargs
                 )
+                response.raise_for_status()
+                return response
             except requests.exceptions.RequestException as e:
                 last_exc = e
                 if attempt < RETRY_TIMES:

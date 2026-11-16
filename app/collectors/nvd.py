@@ -114,7 +114,10 @@ class NvdCpeCollector(BaseCollector):
         resp = self._http_get(self.API, params=params)
         if resp.status_code != 200:
             raise RuntimeError(f"NVD API 返回 {resp.status_code}")
-        return resp.json()
+        data = resp.json()
+        if not isinstance(data.get("vulnerabilities"), list) or "totalResults" not in data:
+            raise RuntimeError("NVD 响应结构异常")
+        return data
 
     # ---------- 单源模式(回退 / 精确 CPE) ----------
 
@@ -171,7 +174,7 @@ class NvdCpeCollector(BaseCollector):
         # 提取 CVSS v3.1 / v3.0 评分
         cvss = None
         metrics = cve.get("metrics", {})
-        for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        for key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
             for m in metrics.get(key, []):
                 cvss = m.get("cvssData", {}).get("baseScore")
                 if cvss is not None:

@@ -5,7 +5,7 @@
    每个工作线程使用自己的 DB Session(SQLAlchemy Session 非线程安全)。
 2. 每个源采集结果批量入库(crud.upsert_many 一次 commit),不再逐条 commit。
 3. 全局采集锁:定时任务与 Web 手动采集不会并发执行同一批源,避免数据竞争。
-4. 首次采集「基线保护」:库里没有漏洞时只入库、不推送,避免首次上线轰炸历史数据。
+4. 每个源首次成功采集建立历史基线,失败不建基线,后续待推送记录持久化。
 5. 推送报告分片发送;静默时段/定时时间统一按业务时区(config.now_local)计算。
 6. 每次任务都写 AlertLog(success/failed/skipped/silent/baseline),便于追溯。
 """
@@ -21,7 +21,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from . import config, crud, models
 from .collectors import get_collector
-from .notifier import CHANNEL_KEYS, build_report_messages, send
+from .notifier import CHANNEL_KEYS, build_report_batches, send
 
 logger = logging.getLogger("vulnwatch")
 scheduler = BackgroundScheduler(timezone=config.TZ)
@@ -77,6 +77,7 @@ def collect_source(db, source: models.MonitorSource) -> dict:
         new_count, new_items = crud.upsert_many(db, source.id, items)
         result["new_count"] = new_count
         result["new_vulns"] = new_items
+        result["baseline"] = crud.record_collection(db, source.id, len(items), new_count)
     except Exception as e:
         logger.exception("采集 %s 失败", source.name)
         try:
@@ -84,6 +85,10 @@ def collect_source(db, source: models.MonitorSource) -> dict:
         except Exception:
             pass
         result["error"] = str(e)
+        try:
+            crud.record_collection(db, source.id, 0, 0, str(e))
+        except Exception:
+            db.rollback()
     return result
 
 
@@ -334,8 +339,8 @@ def _log_alert(db, severity: str, count: int, status: str, detail: str) -> None:
 def run_daily_job():
     """每日汇总任务:采集 → 过滤 → 推送 → 记录日志。
 
-    只推送「本次采集新增」的漏洞(而非近 24 小时全量),这样首次建基线不会
-    轰炸历史数据,后续也只推真实增量。
+    读取持久化待推送记录；每个源首次成功采集只建立基线。
+    手动采集、静默延期和发送失败的数据会在后续任务继续处理。
     """
     from .database import SessionLocal
 
@@ -344,25 +349,19 @@ def run_daily_job():
         return
     db = SessionLocal()
     try:
-        baseline = crud.count_vulnerabilities(db) == 0
         total_new = 0
         to_push: List = []
         threshold = (crud.get_setting(db, "alert_threshold", "HIGH") or "HIGH").upper()
 
         results = collect_all()
         total_new = sum(r["new_count"] for r in results)
-        new_vulns: List = []
-        for r in results:
-            new_vulns.extend(r.get("new_vulns", []))
-
-        if baseline:
-            detail = f"首次采集建立基线:新增 {total_new} 条,本次不推送"
-            _log_alert(db, threshold, 0, "baseline", detail)
-            logger.info("每日任务:%s", detail)
-            return
-
-        to_push = _filter_to_push(db, new_vulns, threshold)
-        detail = f"新增 {total_new} 条,过滤后 {len(to_push)} 条"
+        # Read durable pending records, including manual collections and failed
+        # deliveries from earlier days. Each source has its own initial baseline.
+        db.expire_all()
+        to_push = _filter_to_push(db, crud.pending_notifications(db), threshold)
+        baseline_count = sum(bool(r.get("baseline")) for r in results)
+        failures = sum(bool(r.get("error")) for r in results)
+        detail = f"新增 {total_new} 条,待推送 {len(to_push)} 条,基线源 {baseline_count},失败源 {failures}"
 
         # 静默时段:静默窗口内只入库不推送
         if _is_silent_time(db):
@@ -380,24 +379,34 @@ def run_daily_job():
         secret = (crud.get_setting(db, secret_key, "") or "") if secret_key else ""
 
         if not to_push or not credential:
-            _log_alert(db, threshold, 0, "skipped", detail + ",无需要推送内容或未配置凭证")
+            status = "failed" if failures else ("baseline" if baseline_count else "skipped")
+            _log_alert(db, threshold, 0, status, detail + ",无需要推送内容或未配置凭证")
             logger.info("每日任务:跳过推送(%s)", detail)
             return
 
         # AI 摘要(可选增强,失败不影响主链路)
         _fill_ai_summaries(db, to_push)
 
-        messages = build_report_messages(to_push, threshold)
+        batches = build_report_batches(to_push, threshold)
         ok = True
-        for idx, text in enumerate(messages, 1):
-            if not send(channel, credential, secret, "漏洞情报汇总", text):
+        sent_count = 0
+        for idx, (text, batch_items) in enumerate(batches, 1):
+            if send(channel, credential, secret, "漏洞情报汇总", text):
+                crud.acknowledge_notifications(db, batch_items)
+                sent_count += len(batch_items)
+            else:
                 ok = False
-                logger.warning("第 %d/%d 段报告发送失败", idx, len(messages))
+                logger.warning("第 %d/%d 段报告发送失败,保留待推送记录", idx, len(batches))
+                break
+            if idx < len(batches):
+                # DingTalk robots rate-limit bursts; keep below 20 messages/minute.
+                from time import sleep
+                sleep(3.1)
         status = "success" if ok else "failed"
-        detail += f",推送 {len(to_push)} 条/{len(messages)} 条消息(通道:{channel})"
-        _log_alert(db, threshold, len(to_push), status, detail)
+        detail += f",已发送 {sent_count} 条/{len(batches)} 段(通道:{channel})"
+        _log_alert(db, threshold, sent_count, status, detail)
         logger.info("每日任务完成: 新增 %s, 过滤后 %s, 推送 %s 条 [%s]",
-                    total_new, len(to_push), len(to_push), status)
+                    total_new, len(to_push), sent_count, status)
     except Exception as e:
         logger.exception("每日任务异常")
         _log_alert(db, "UNKNOWN", 0, "failed", f"任务异常: {e}")

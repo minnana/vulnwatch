@@ -4,6 +4,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from . import config, models, schemas
 
@@ -187,6 +188,59 @@ def list_vulnerabilities(
 def count_vulnerabilities(db: Session) -> int:
     """库里已有漏洞总数,用于判断"首次采集基线"。"""
     return int(db.query(func.count(models.Vulnerability.id)).scalar() or 0)
+
+
+def notification_key(v) -> str:
+    def field(name):
+        return v.get(name) if isinstance(v, dict) else getattr(v, name, None)
+    cve = str(field("cve_id") or "").strip().upper()
+    identity = cve or f"source:{field('source_id')}:{field('unique_key') or field('id')}"
+    return identity + (":kev" if field("is_kev") else ":normal")
+
+
+def acknowledge_notifications(db: Session, vulns, status="sent") -> None:
+    keys = set()
+    for v in vulns:
+        key = notification_key(v)
+        keys.add(key)
+        if key.endswith(":kev"):
+            keys.add(key[:-4] + ":normal")
+    for key in keys:
+        db.execute(sqlite_insert(models.NotificationReceipt).values(
+            event_key=key, status=status, recorded_at=config.utcnow()
+        ).on_conflict_do_nothing(index_elements=["event_key"]))
+    db.commit()
+
+
+def record_collection(db: Session, source_id: int, fetched: int, new_count: int, error=None) -> bool:
+    state = db.get(models.SourceCollectionState, source_id)
+    if state is None:
+        state = models.SourceCollectionState(source_id=source_id)
+        db.add(state)
+    state.last_attempt_at = config.utcnow()
+    state.fetched, state.new_count, state.error = fetched, new_count, error
+    baseline = error is None and state.first_success_at is None
+    if baseline:
+        state.first_success_at = config.utcnow()
+        # A new/recovered source establishes its own baseline, even when other
+        # sources already have data. Failed collections never initialize it.
+        rows = db.query(models.Vulnerability).filter_by(source_id=source_id).all()
+        db.flush()
+        acknowledge_notifications(db, rows, "baseline")
+    else:
+        db.commit()
+    return baseline
+
+
+def pending_notifications(db: Session):
+    acknowledged = {r[0] for r in db.query(models.NotificationReceipt.event_key).all()}
+    rows = (db.query(models.Vulnerability)
+            .join(models.SourceCollectionState,
+                  models.SourceCollectionState.source_id == models.Vulnerability.source_id)
+            .join(models.MonitorSource, models.MonitorSource.id == models.Vulnerability.source_id)
+            .filter(models.SourceCollectionState.first_success_at.isnot(None),
+                    models.MonitorSource.enabled.is_(True)).all())
+    return [v for v in rows if notification_key(v) not in acknowledged]
 
 
 def stats(db: Session, days: int = 7) -> dict:

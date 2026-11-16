@@ -24,6 +24,8 @@ class ThreatbookCollector(BaseCollector):
         if resp.status_code != 200:
             return []
         data = resp.json()
+        if not isinstance(data.get("data"), dict) or not isinstance(data["data"].get("highrisk"), list):
+            raise RuntimeError("微步接口结构变化或访问受限")
         high_risk = data.get("data", {}).get("highrisk", [])
         results = []
         for v in high_risk:

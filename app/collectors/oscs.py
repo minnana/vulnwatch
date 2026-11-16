@@ -33,15 +33,12 @@ class OscsCollector(BaseCollector):
         candidates = []
         for page in range(1, 4):
             body = json.dumps({"page": page, "per_page": 20})
-            try:
-                resp = self._http_post(LIST_API, data=body, headers=headers)
-            except Exception:
-                break
+            resp = self._http_post(LIST_API, data=body, headers=headers)
             if resp is None or resp.status_code != 200:
                 break
             data = resp.json()
             if data.get("code") != 200 or not data.get("success"):
-                break
+                raise RuntimeError("OSCS 列表接口返回失败状态")
             items = data.get("data", {}).get("data", [])
             if not items:
                 break
